@@ -118,19 +118,11 @@ def main():
     # Take a best snapshot
     record_trigger = training.triggers.MaxValueTrigger(
         'validation/main/accuracy', (1, 'epoch'))
-
     def model_checkpoint(trainer):
         print(trainer.updater.epoch)
         chainer.serializers.save_npz(os.path.join(args.out, 'snapshot_epoch_{}'.format(trainer.updater.epoch)), trainer)
         chainer.serializers.save_npz(os.path.join(args.out, 'best_model.npz'), model)
     trainer.extend(model_checkpoint, trigger=record_trigger)
-
-    # trainer.extend(
-    #     extensions.snapshot(filename='snapshot_epoch_{.updater.epoch}'),
-    #     trigger=record_trigger)
-    # trainer.extend(extensions.snapshot_object(
-    #     model, 'best_model.npz'),
-    #     trigger=record_trigger)
 
     # Write a log of evaluation statistics for each epoch
     trainer.extend(extensions.LogReport())
