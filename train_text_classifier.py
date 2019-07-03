@@ -51,8 +51,8 @@ def main():
                         choices=['cnn', 'rnn', 'bow'],
                         help='Name of encoder model type.')
     parser.add_argument('--char-based', action='store_true')
-    parser.add_argument('--test', dest='test', action='store_true')
-    parser.set_defaults(test=False)
+    parser.add_argument('--testing', dest='testing', action='store_true')
+    parser.set_defaults(testing=False)
     group = parser.add_argument_group('deprecated arguments')
     group.add_argument('--gpu', '-g', dest='device',
                        type=int, nargs='?', const=0,
@@ -71,24 +71,31 @@ def main():
     device.use()
 
     # Load a dataset
-    if args.dataset == 'dbpedia':
-        train, test, vocab = text_datasets.get_dbpedia(
-            char_based=args.char_based)
-    elif args.dataset.startswith('imdb.'):
+    if args.dataset.startswith('imdb.'):
         train, test, vocab = text_datasets.get_imdb(
             fine_grained=args.dataset.endswith('.fine'),
             char_based=args.char_based)
-    elif args.dataset in ['TREC', 'stsa.binary', 'stsa.fine',
-                          'custrev', 'mpqa', 'rt-polarity', 'subj']:
-        train, test, vocab = text_datasets.get_other_text_dataset(
-            args.dataset, char_based=args.char_based)
+    # elif args.dataset == 'dbpedia':
+    #     train, valid, vocab = text_datasets.get_dbpedia(
+    #         char_based=args.char_based)
+    # elif args.dataset in ['TREC', 'stsa.binary', 'stsa.fine',
+    #                       'custrev', 'mpqa', 'rt-polarity', 'subj']:
+    #     train, valid, vocab = text_datasets.get_other_text_dataset(
+    #         args.dataset, char_based=args.char_based)
 
-    if args.test:
+    # Split train into train and valid
+    pos_train = train[:12500]
+    neg_train = train[12500:]
+    valid = pos_train[11250:] + neg_train[11250:]
+    train = pos_train[:11250] + neg_train[:11250]
+
+    if args.testing:
         train = train[:100]
         test = test[:100]
 
     print('Device: {}'.format(device))
     print('# train data: {}'.format(len(train)))
+    print('# valid data: {}'.format(len(valid)))
     print('# test  data: {}'.format(len(test)))
     print('# vocab: {}'.format(len(vocab)))
     n_class = len(set([int(d[1]) for d in train]))
@@ -114,10 +121,10 @@ def main():
 
     # Set up iterators
     train_iter = chainer.iterators.SerialIterator(train, args.batchsize)
-    test_iter = chainer.iterators.SerialIterator(test, args.batchsize,
-                                                 repeat=False, shuffle=False)
+    valid_iter = chainer.iterators.SerialIterator(valid, args.batchsize, repeat=False, shuffle=False)
+    test_iter = chainer.iterators.SerialIterator(test, args.batchsize, repeat=False, shuffle=False)
 
-    best_val_acc = 0
+    best_valid_acc = 0
     train_accuracies = []
 
     if args.resume is not None:
@@ -158,7 +165,7 @@ def main():
         # Check the validation accuracy of prediction after every epoch
         if train_iter.is_new_epoch:  # If this iteration is the final iteration of the current epoch
 
-            # Display the training loss
+            # Display training loss and accuracy
             print('epoch:{:02d} train_loss:{:.04f} '.format(
                 train_iter.epoch + int(checkpoint_epoch), float(to_cpu(loss.array))), end='')
             print('train_accuracy:{:.04f} '.format(
@@ -166,6 +173,41 @@ def main():
             sys.stdout.flush()
             train_accuracies = []
 
+            valid_losses = []
+            valid_accuracies = []
+            for valid_batch in valid_iter:
+                valid_data = convert_seq(valid_batch, device)
+                valid_x = valid_data['xs']
+                valid_y = valid_data['ys']
+                valid_y = F.concat(valid_y, axis=0)
+
+                # Forward the valid data
+                prediction_valid = model(valid_x)
+
+                # Calculate the loss
+                loss_valid = F.softmax_cross_entropy(prediction_valid, valid_y)
+                valid_losses.append(to_cpu(loss_valid.array))
+
+                # Calculate the accuracy
+                accuracy = F.accuracy(prediction_valid, valid_y)
+                accuracy.to_cpu()
+                valid_accuracies.append(accuracy.array)
+
+            valid_iter.reset()
+
+            print('valid_loss:{:.04f} valid_accuracy:{:.04f}'.format(
+                np.mean(valid_losses), np.mean(valid_accuracies)))
+
+            # Checkpointing
+            cur_valid_acc = np.mean(valid_accuracies)
+            if cur_valid_acc > best_valid_acc:
+                best_valid_acc = cur_valid_acc
+                chainer.serializers.save_npz(os.path.join(args.out, 'model_epoch_{}.npz'.format(train_iter.epoch + int(checkpoint_epoch))), model)
+                chainer.serializers.save_npz(os.path.join(args.out, 'state_epoch_{}.npz'.format(train_iter.epoch + int(checkpoint_epoch))), optimizer)
+                chainer.serializers.save_npz(os.path.join(args.out, 'best_model.npz'), model)
+                chainer.serializers.save_npz(os.path.join(args.out, 'best_state.npz'), optimizer)
+
+            # Predict on test
             test_losses = []
             test_accuracies = []
             for test_batch in test_iter:
@@ -188,17 +230,8 @@ def main():
 
             test_iter.reset()
 
-            print('val_loss:{:.04f} val_accuracy:{:.04f}'.format(
+            print('test_loss:{:.04f} test_accuracy:{:.04f}'.format(
                 np.mean(test_losses), np.mean(test_accuracies)))
-
-            # Checkpointing
-            cur_val_acc = np.mean(test_accuracies)
-            if cur_val_acc > best_val_acc:
-                best_val_acc = cur_val_acc
-                chainer.serializers.save_npz(os.path.join(args.out, 'model_epoch_{}.npz'.format(train_iter.epoch + int(checkpoint_epoch))), model)
-                chainer.serializers.save_npz(os.path.join(args.out, 'state_epoch_{}.npz'.format(train_iter.epoch + int(checkpoint_epoch))), optimizer)
-                chainer.serializers.save_npz(os.path.join(args.out, 'best_model.npz'), model)
-                chainer.serializers.save_npz(os.path.join(args.out, 'best_state.npz'), optimizer)
 
     chainer.serializers.save_npz(os.path.join(args.out, 'model_epoch_{}.npz'.format(train_iter.epoch + int(checkpoint_epoch))), model)
     chainer.serializers.save_npz(os.path.join(args.out, 'state_epoch_{}.npz'.format(train_iter.epoch + int(checkpoint_epoch))), optimizer)

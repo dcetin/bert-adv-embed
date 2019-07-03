@@ -49,7 +49,7 @@ def get_dbpedia(vocab=None, shrink=1, char_based=False):
     test = read_dbpedia(tf, 'test', shrink=shrink, char_based=char_based)
 
     if vocab is None:
-        print('constract vocabulary based on frequency')
+        print('construct vocabulary based on frequency')
         vocab = make_vocab(train)
 
     train = transform_to_array(train, vocab)
@@ -89,8 +89,8 @@ def read_imdb(path, split,
                 dataset.append((tokens, label))
         return dataset
 
-    pos_dataset = read_and_label('pos', 0)
-    neg_dataset = read_and_label('neg', 1)
+    pos_dataset = read_and_label('pos', 1)
+    neg_dataset = read_and_label('neg', 0)
     return pos_dataset + neg_dataset
 
 
@@ -109,7 +109,7 @@ def get_imdb(vocab=None, shrink=1, fine_grained=False,
     shutil.rmtree(tmp_path)
 
     if vocab is None:
-        print('constract vocabulary based on frequency')
+        print('construct vocabulary based on frequency')
         vocab = make_vocab(train)
 
     train = transform_to_array(train, vocab)
@@ -163,7 +163,7 @@ def get_other_text_dataset(name, vocab=None, shrink=1,
         test = alldata[-len(alldata) // 10:]
 
     if vocab is None:
-        print('constract vocabulary based on frequency')
+        print('construct vocabulary based on frequency')
         vocab = make_vocab(train)
 
     train = transform_to_array(train, vocab)
