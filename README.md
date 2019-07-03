@@ -1,5 +1,11 @@
 # Neural Networks for Text Classification
 
+## TODO
+- Currently padding is done by inserting eos tokens (i.e. 0s).
+- Model is not really fine-tuned at all.
+
+## Original Readme
+
 This is an example of text classification using typical neural networks. This code can switch choices below:  
 - LSTM
 - CNN + MLP

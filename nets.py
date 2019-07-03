@@ -107,6 +107,39 @@ class TextClassifier(chainer.Chain):
             return concat_outputs
 
 
+class BasicNetwork(chainer.Chain):
+
+    """A classifier using a given encoder.
+
+     This chain encodes a sentence and classifies it into classes.
+
+     Args:
+         encoder (Link): A callable encoder, which extracts a feature.
+             Input is a list of variables whose shapes are
+             "(sentence_length, )".
+             Output is a variable whose shape is "(batchsize, n_units)".
+         n_class (int): The number of classes to be predicted.
+
+     """
+
+    def __init__(self, encoder, n_class, dropout=0.1):
+        super(BasicNetwork, self).__init__()
+        with self.init_scope():
+            self.encoder = encoder
+            self.output = L.Linear(encoder.out_units, n_class)
+        self.dropout = dropout
+
+    def forward(self, xs, softmax=False, argmax=False):
+        concat_encodings = F.dropout(self.encoder(xs), ratio=self.dropout)
+        concat_outputs = self.output(concat_encodings)
+        if softmax:
+            return F.softmax(concat_outputs).array
+        elif argmax:
+            return self.xp.argmax(concat_outputs.array, axis=1)
+        else:
+            return concat_outputs
+
+
 class RNNEncoder(chainer.Chain):
 
     """A LSTM-RNN Encoder with Word Embedding.

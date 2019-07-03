@@ -13,6 +13,11 @@ import text_datasets
 
 from chainer.training import extensions
 from chainer import serializers
+from chainer.dataset import concat_examples
+from chainer.backends.cuda import to_cpu
+import chainer.functions as F
+import numpy as np
+import sys
 
 def main():
     current_datetime = '{}'.format(datetime.datetime.today())
@@ -53,8 +58,14 @@ def main():
                        type=int, nargs='?', const=0,
                        help='GPU ID (negative value indicates CPU)')
 
+    parser.add_argument('--learning_rate', type=float, default=0.001,
+                        help='Learning rate')
+
     args = parser.parse_args()
     print(json.dumps(args.__dict__, indent=2))
+
+    if not os.path.exists(args.out):
+        os.makedirs(args.out)
 
     device = chainer.get_device(args.device)
     device.use()
@@ -83,10 +94,6 @@ def main():
     n_class = len(set([int(d[1]) for d in train]))
     print('# class: {}'.format(n_class))
 
-    train_iter = chainer.iterators.SerialIterator(train, args.batchsize)
-    test_iter = chainer.iterators.SerialIterator(test, args.batchsize,
-                                                 repeat=False, shuffle=False)
-
     # Setup a model
     if args.model == 'rnn':
         Encoder = nets.RNNEncoder
@@ -96,42 +103,105 @@ def main():
         Encoder = nets.BOWMLPEncoder
     encoder = Encoder(n_layers=args.layer, n_vocab=len(vocab),
                       n_units=args.unit, dropout=args.dropout)
-    model = nets.TextClassifier(encoder, n_class)
+    # model = nets.TextClassifier(encoder, n_class)
+    model = nets.BasicNetwork(encoder, n_class)
     model.to_device(device)  # Copy the model to the device
 
     # Setup an optimizer
-    optimizer = chainer.optimizers.Adam()
+    optimizer = chainer.optimizers.Adam(alpha=args.learning_rate)
     optimizer.setup(model)
     optimizer.add_hook(chainer.optimizer.WeightDecay(1e-4))
 
-    # Set up a trainer
-    updater = training.updaters.StandardUpdater(
-        train_iter, optimizer,
-        converter=convert_seq, device=device)
-    trainer = training.Trainer(updater, (args.epoch, 'epoch'), out=args.out)
+    # Set up iterators
+    train_iter = chainer.iterators.SerialIterator(train, args.batchsize)
+    test_iter = chainer.iterators.SerialIterator(test, args.batchsize,
+                                                 repeat=False, shuffle=False)
 
-    # Evaluate the model with the test dataset for each epoch
-    trainer.extend(extensions.Evaluator(
-        test_iter, model,
-        converter=convert_seq, device=device))
+    best_val_acc = 0
+    train_accuracies = []
 
-    # Take a best snapshot
-    record_trigger = training.triggers.MaxValueTrigger(
-        'validation/main/accuracy', (1, 'epoch'))
-    def model_checkpoint(trainer):
-        print(trainer.updater.epoch)
-        chainer.serializers.save_npz(os.path.join(args.out, 'snapshot_epoch_{}'.format(trainer.updater.epoch)), trainer)
-        chainer.serializers.save_npz(os.path.join(args.out, 'best_model.npz'), model)
-    trainer.extend(model_checkpoint, trigger=record_trigger)
+    if args.resume is not None:
+        checkpoint_epoch = args.resume
+        chainer.serializers.load_npz(os.path.join(args.out, 'model_epoch_{}.npz'.format(checkpoint_epoch)), model)
+        chainer.serializers.load_npz(os.path.join(args.out, 'state_epoch_{}.npz'.format(checkpoint_epoch)), optimizer)
+    else:
+        checkpoint_epoch = 0
 
-    # Write a log of evaluation statistics for each epoch
-    trainer.extend(extensions.LogReport())
-    trainer.extend(extensions.PrintReport(
-        ['epoch', 'main/loss', 'validation/main/loss',
-         'main/accuracy', 'validation/main/accuracy', 'elapsed_time']))
+    # Training loop
+    while train_iter.epoch < args.epoch - int(checkpoint_epoch):
 
-    # Print a progress bar to stdout
-    trainer.extend(extensions.ProgressBar())
+        # ---------- One iteration of the training loop ----------
+        train_batch = train_iter.next()
+        train_data = convert_seq(train_batch, device)
+        train_x = train_data['xs']
+        train_y = train_data['ys']
+        train_y = F.concat(train_y, axis=0)
+
+        # Calculate the prediction of the network
+        prediction_train = model(train_x)
+
+        # Calculate the loss with softmax_cross_entropy
+        loss = F.softmax_cross_entropy(prediction_train, train_y)
+
+        accuracy = F.accuracy(prediction_train, train_y)
+        accuracy.to_cpu()
+        train_accuracies.append(accuracy.array)
+
+        # Calculate the gradients in the network
+        model.cleargrads()
+        loss.backward()
+
+        # Update all the trainable parameters
+        optimizer.update()
+        # --------------------- until here ---------------------
+
+        # Check the validation accuracy of prediction after every epoch
+        if train_iter.is_new_epoch:  # If this iteration is the final iteration of the current epoch
+
+            # Display the training loss
+            print('epoch:{:02d} train_loss:{:.04f} '.format(
+                train_iter.epoch + int(checkpoint_epoch), float(to_cpu(loss.array))), end='')
+            print('train_accuracy:{:.04f} '.format(
+                np.mean(train_accuracies)), end='')
+            sys.stdout.flush()
+            train_accuracies = []
+
+            test_losses = []
+            test_accuracies = []
+            for test_batch in test_iter:
+                test_data = convert_seq(test_batch, device)
+                test_x = test_data['xs']
+                test_y = test_data['ys']
+                test_y = F.concat(test_y, axis=0)
+
+                # Forward the test data
+                prediction_test = model(test_x)
+
+                # Calculate the loss
+                loss_test = F.softmax_cross_entropy(prediction_test, test_y)
+                test_losses.append(to_cpu(loss_test.array))
+
+                # Calculate the accuracy
+                accuracy = F.accuracy(prediction_test, test_y)
+                accuracy.to_cpu()
+                test_accuracies.append(accuracy.array)
+
+            test_iter.reset()
+
+            print('val_loss:{:.04f} val_accuracy:{:.04f}'.format(
+                np.mean(test_losses), np.mean(test_accuracies)))
+
+            # Checkpointing
+            cur_val_acc = np.mean(test_accuracies)
+            if cur_val_acc > best_val_acc:
+                best_val_acc = cur_val_acc
+                chainer.serializers.save_npz(os.path.join(args.out, 'model_epoch_{}.npz'.format(train_iter.epoch + int(checkpoint_epoch))), model)
+                chainer.serializers.save_npz(os.path.join(args.out, 'state_epoch_{}.npz'.format(train_iter.epoch + int(checkpoint_epoch))), optimizer)
+                chainer.serializers.save_npz(os.path.join(args.out, 'best_model.npz'), model)
+                chainer.serializers.save_npz(os.path.join(args.out, 'best_state.npz'), optimizer)
+
+    chainer.serializers.save_npz(os.path.join(args.out, 'model_epoch_{}.npz'.format(train_iter.epoch + int(checkpoint_epoch))), model)
+    chainer.serializers.save_npz(os.path.join(args.out, 'state_epoch_{}.npz'.format(train_iter.epoch + int(checkpoint_epoch))), optimizer)
 
     # Save vocabulary and model's setting
     if not os.path.isdir(args.out):
@@ -140,19 +210,15 @@ def main():
     with open(vocab_path, 'w') as f:
         json.dump(vocab, f)
     model_path = os.path.join(args.out, 'best_model.npz')
+    state_path = os.path.join(args.out, 'best_state.npz')
     model_setup = args.__dict__
     model_setup['vocab_path'] = vocab_path
     model_setup['model_path'] = model_path
+    model_setup['state_path'] = state_path
     model_setup['n_class'] = n_class
     model_setup['datetime'] = current_datetime
     with open(os.path.join(args.out, 'args.json'), 'w') as f:
         json.dump(args.__dict__, f)
-
-    if args.resume is not None:
-        chainer.serializers.load_npz(args.resume, trainer)
-    # Run the training
-    trainer.run()
-
 
 if __name__ == '__main__':
     main()

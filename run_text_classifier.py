@@ -27,7 +27,8 @@ def setup_model(device, model_setup):
         Encoder = nets.BOWMLPEncoder
     encoder = Encoder(n_layers=setup['layer'], n_vocab=len(vocab),
                       n_units=setup['unit'], dropout=setup['dropout'])
-    model = nets.TextClassifier(encoder, n_class)
+    # model = nets.TextClassifier(encoder, n_class)
+    model = nets.BasicNetwork(encoder, n_class)
     chainer.serializers.load_npz(setup['model_path'], model)
     model.to_device(device)  # Copy the model to the device
 
@@ -46,7 +47,7 @@ def run_online(device):
         xs = nlp_utils.transform_to_array([words], vocab, with_label=False)
         xs = nlp_utils.convert_seq(xs, device=device, with_label=False)
         with chainer.using_config('train', False), chainer.no_backprop_mode():
-            prob = model.predict(xs, softmax=True)[0]
+            prob = model.forward(xs, softmax=True)[0]
         answer = int(model.xp.argmax(prob))
         score = float(prob[answer])
         print('{}\t{:.4f}\t{}'.format(answer, score, ' '.join(words)))
@@ -59,7 +60,7 @@ def run_batch(device, batchsize=64):
         xs = nlp_utils.transform_to_array(words_batch, vocab, with_label=False)
         xs = nlp_utils.convert_seq(xs, device=device, with_label=False)
         with chainer.using_config('train', False), chainer.no_backprop_mode():
-            probs = model.predict(xs, softmax=True)
+            probs = model.forward(xs, softmax=True)
         answers = model.xp.argmax(probs, axis=1)
         scores = probs[model.xp.arange(answers.size), answers].tolist()
         for words, answer, score in zip(words_batch, answers, scores):
