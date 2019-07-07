@@ -27,7 +27,6 @@ def setup_model(device, model_setup):
         Encoder = nets.BOWMLPEncoder
     encoder = Encoder(n_layers=setup['layer'], n_vocab=len(vocab),
                       n_units=setup['unit'], dropout=setup['dropout'])
-    # model = nets.TextClassifier(encoder, n_class)
     model = nets.BasicNetwork(encoder, n_class)
     chainer.serializers.load_npz(setup['model_path'], model)
     model.to_device(device)  # Copy the model to the device
