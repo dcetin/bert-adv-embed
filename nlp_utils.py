@@ -1,8 +1,7 @@
 import collections
 import io
-
 import numpy
-
+import re
 import chainer
 
 
@@ -13,11 +12,22 @@ def split_text(text, char_based=False):
         return text.split()
 
 
-def normalize_text(text):
-    return text.strip().lower()
+def split_by_punct(segment):
+    '''Splits str segment by punctuation, filters our empties and spaces.'''
+    return [s for s in re.split(r'\W+', segment) if s and not s.isspace()]
 
 
-def make_vocab(dataset, max_vocab_size=20000, min_freq=2):
+def tokenize(text, char_based):
+    # tokens = split_text(text.strip().lower(), char_based)
+    tokens = split_by_punct(text.strip())
+    # tokens = split_by_punct(text.strip().lower())
+    return tokens
+
+
+def make_vocab(dataset, max_vocab_size=None, min_freq=2):
+    '''
+    max_vocab_size (int): None means unlimited vocaulary size.
+    '''
     counts = collections.defaultdict(int)
     for tokens, _ in dataset:
         for token in tokens:
@@ -25,20 +35,23 @@ def make_vocab(dataset, max_vocab_size=20000, min_freq=2):
 
     vocab = {'<eos>': 0, '<unk>': 1}
     for w, c in sorted(counts.items(), key=lambda x: (-x[1], x[0])):
-        if len(vocab) >= max_vocab_size or c < min_freq:
+        if (max_vocab_size is not None and len(vocab) >= max_vocab_size) or c < min_freq:
             break
         vocab[w] = len(vocab)
     return vocab
 
 
-def read_vocab_list(path, max_vocab_size=20000):
+def read_vocab_list(path, max_vocab_size=None):
+    '''
+    max_vocab_size (int): None means unlimited vocaulary size.
+    '''
     vocab = {'<eos>': 0, '<unk>': 1}
     with io.open(path, encoding='utf-8', errors='ignore') as f:
         for l in f:
             w = l.strip()
             if w not in vocab and w:
                 vocab[w] = len(vocab)
-            if len(vocab) >= max_vocab_size:
+            if max_vocab_size is not None and len(vocab) >= max_vocab_size:
                 break
     return vocab
 
