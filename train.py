@@ -89,12 +89,12 @@ def imdb_loader(tempdir, max_vocab_size=None, testing=False, write=True, sato=Tr
 
     return train, valid, test, unsup, vocab, unvocab
 
-def adv_FGSM(model, encoder, test_x, test_y, epsilon=1.0, norm='l2'):
+def adv_FGSM(model, test_x, test_y, epsilon=1.0, norm='l2'):
     '''
     Applies FGSM on embeddings once.
     '''
-    embed_x = sequence_embed(encoder.embed, test_x, encoder.dropout)
-    prediction_test = model.embed_forward(embed_x)
+    embed_x = sequence_embed(model.embed, test_x, model.dropout)
+    prediction_test = model(embed_x, feed_embed=True)
     loss_test = F.softmax_cross_entropy(prediction_test, test_y, normalize=True)
     model.cleargrads()
     adv_g = chainer.grad([loss_test], model.embed_inputs)
@@ -107,15 +107,7 @@ def adv_FGSM(model, encoder, test_x, test_y, epsilon=1.0, norm='l2'):
     perturbed = [x+p for x, p in zip(embed_x, adv_p)]
     return perturbed
 
-def adv_FGSM_k(model, encoder, test_x, test_y, epsilon=1.0, k=1, norm='l2'):
-    '''
-    Applies FGSM on embeddings several times.
-    '''
-    for i in range(k):
-        test_x = adv_FGSM(model, encoder, test_x, test_y, epsilon=epsilon, norm=norm)
-    return test_x
-
-def evaluate_fn(eval_iter, device, model, encoder, adversarial=False):
+def evaluate_fn(eval_iter, device, model, adversarial=False, epsilon=1.0):
     '''
     Evaluates the model on one epoch of the iterator.Supports standard and adversarial evaluation.
     '''
@@ -128,12 +120,12 @@ def evaluate_fn(eval_iter, device, model, encoder, adversarial=False):
         test_y = F.concat(test_y, axis=0)
 
         if adversarial:
-            test_x = adv_FGSM(model, encoder, test_x, test_y)
+            test_x = adv_FGSM(model, test_x, test_y, epsilon)
 
         with chainer.using_config('train', False):
             # Forward the test data
             if adversarial: # Adversarial evaluation
-                prediction_test = model.embed_forward(test_x)
+                prediction_test = model(test_x, feed_embed=True)
             else: # Standard evaluation
                 prediction_test = model(test_x)
             # Calculate the loss
@@ -204,8 +196,9 @@ def main():
     parser.add_argument('--layers', type=int, default=1, help='Number of layers of RNN or MLP following CNN.')
     parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate.')
     # Adversarial
-    parser.add_argument('--adv_lambda', type=float, default=1, help='Adversarial training coefficient.')
+    parser.add_argument('--adv_lambda', type=float, default=1.0, help='Adversarial training loss weight.')
     parser.add_argument('--adv_train', dest='adv_train', action='store_true')
+    parser.add_argument('--adv_epsilon', type=float, default=5.0, help='Adversarial training perturbation scale.')
     # Testing
     parser.add_argument('--random_seed', dest='random_seed', type=int, default=1234, help='Random seed.')
     parser.add_argument('--testing', dest='testing', action='store_true', help='Loads a small portion of data for debugging.')
@@ -264,9 +257,8 @@ def main():
     logger.info('# class: {} \n'.format(n_class))
 
     # Setup the model
-    encoder = nets.RNNEncoder(n_layers=args.layers, n_vocab=len(vocab),
-                      n_units=args.rnn_units, embed_size=args.embed_size, dropout=args.dropout)
-    model = nets.classifierModel(encoder, n_class, hidden_units=args.hidden_units, dropout=args.dropout)
+    model = nets.classifierModel(n_class, n_layers=args.layers, n_vocab=len(vocab),
+        n_units=args.rnn_units, embed_size=args.embed_size, hidden_units=args.hidden_units, dropout=args.dropout)
     model.to_device(device) # Copy the model to the device
 
     # Setup an optimizer
@@ -324,8 +316,8 @@ def main():
 
             # Adversarial training
             if args.adv_train:
-                perturbed = adv_FGSM(model, encoder, train_x, train_y)
-                prediction_train = model.embed_forward(perturbed)
+                perturbed = adv_FGSM(model, train_x, train_y, epsilon=args.adv_epsilon)
+                prediction_train = model(perturbed, feed_embed=True)
                 loss_adv = F.softmax_cross_entropy(prediction_train, train_y, normalize=True)
                 loss = loss + args.adv_lambda * loss_adv
                 accuracy = F.accuracy(prediction_train, train_y)
@@ -357,15 +349,15 @@ def main():
                 logger.info('alpha:{:.04f} global_step:{:.04f} '.format(optimizer.hyperparam.alpha, global_step))
 
                 # Evaluation on validation data
-                valid_loss, valid_acc = evaluate_fn(valid_iter, device, model, encoder)
+                valid_loss, valid_acc = evaluate_fn(valid_iter, device, model)
                 logger.info('valid_loss:{:.04f} valid_accuracy:{:.04f}'.format(valid_loss, valid_acc))
-                adv_valid_loss, adv_valid_acc = evaluate_fn(valid_iter, device, model, encoder, adversarial=True)
+                adv_valid_loss, adv_valid_acc = evaluate_fn(valid_iter, device, model, adversarial=True, epsilon=args.adv_epsilon)
                 logger.info('adv. valid_loss:{:.04f} adv. valid_accuracy:{:.04f}'.format(adv_valid_loss, adv_valid_acc))
 
                 # Evaluation on test data
-                test_loss, test_acc = evaluate_fn(test_iter, device, model, encoder)
+                test_loss, test_acc = evaluate_fn(test_iter, device, model)
                 logger.info('test_loss:{:.04f} test_accuracy:{:.04f}'.format(test_loss, test_acc))
-                # adv_loss, adv_acc = evaluate_fn(test_iter, device, model, encoder, adversarial=True)
+                # adv_loss, adv_acc = evaluate_fn(test_iter, device, model, adversarial=True, epsilon=args.adv_epsilon)
                 # logger.info('adv. test_loss:{:.04f} adv. test_accuracy:{:.04f}'.format(adv_loss, adv_acc))
 
                 logger.info('\n')
@@ -393,13 +385,13 @@ def main():
     chainer.serializers.load_npz(os.path.join(args.out, 'best_state.npz'), optimizer)
 
     # Evaluation
-    valid_loss, valid_acc = evaluate_fn(valid_iter, device, model, encoder)
+    valid_loss, valid_acc = evaluate_fn(valid_iter, device, model)
     logger.info('valid_loss:{:.04f} valid_accuracy:{:.04f}'.format(valid_loss, valid_acc))
-    adv_valid_loss, adv_valid_acc = evaluate_fn(valid_iter, device, model, encoder, adversarial=True)
+    adv_valid_loss, adv_valid_acc = evaluate_fn(valid_iter, device, model, adversarial=True, epsilon=args.adv_epsilon)
     logger.info('adv. valid_loss:{:.04f} adv. valid_accuracy:{:.04f}'.format(adv_valid_loss, adv_valid_acc))
-    test_loss, test_acc = evaluate_fn(test_iter, device, model, encoder)
+    test_loss, test_acc = evaluate_fn(test_iter, device, model)
     logger.info('test_loss:{:.04f} test_accuracy:{:.04f}'.format(test_loss, test_acc))
-    adv_loss, adv_acc = evaluate_fn(test_iter, device, model, encoder, adversarial=True)
+    adv_loss, adv_acc = evaluate_fn(test_iter, device, model, adversarial=True, epsilon=args.adv_epsilon)
     logger.info('adv. test_loss:{:.04f} adv. test_accuracy:{:.04f}'.format(adv_loss, adv_acc))
 
     # Save vocabulary and model's setting
