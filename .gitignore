@@ -1,5 +1,7 @@
 # Project-specific files and directories
 res_*/
+temp/
+lsf.o*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
