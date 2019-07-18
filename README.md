@@ -1,5 +1,7 @@
 # Clean Adversarial Examples
 
+Classification and adversarial stuff are based on [Neural Networks for Text Classification](https://github.com/chainer/chainer/tree/master/examples/text_classification) and [Interpretable Adversarial Perturbation](https://github.com/dcetin/interpretable-adv), respectively. Please refer to `README_base.md` and `README_iAdv.md` for a quick glance.
+
 ## Directory
 
 ### Current files

@@ -56,9 +56,9 @@ def imdb_loader(tempdir, max_vocab_size=None, testing=False, write=True, sato=Tr
              sato_test_x, sato_test_x_len, sato_test_y) = sato_dataset
             sato_vocab, sato_vocab_count = sato_vocab_obj
             sato_semi_train_x, sato_semi_train_x_len = sato_lm_data
-            print('train_vocab_size:', sato_t_vocab)
+            # print('train_vocab_size:', sato_t_vocab)
             sato_vocab_inv = dict([(widx, w) for w, widx in sato_vocab.items()])
-            print('vocab_inv:', len(sato_vocab_inv))
+            # print('vocab_inv:', len(sato_vocab_inv))
 
             train = list(zip(sato_train_x, [np.asarray([x]) for x in sato_train_y]))
             valid = list(zip(sato_dev_x, [np.asarray([x]) for x in sato_dev_y]))
@@ -141,25 +141,39 @@ def evaluate_fn(eval_iter, device, model, adversarial=False, epsilon=1.0):
 
     return np.mean(test_losses), np.mean(test_accuracies)
 
-def vec_normalize(vec, epsilon=1e-10):
+def vec_normalize(vec, xp=np, epsilon=1e-12):
     return vec / (xp.linalg.norm(vec) + epsilon)
 
-def mat_normalize(mat, epsilon=1e-10):
+def mat_normalize(mat, xp=np, epsilon=1e-12):
     return mat / (xp.linalg.norm(mat, axis=1)[:, xp.newaxis] + epsilon)
 
-def nearest_neighbors(mat, vec, k=1, normalize=True):
+def nn_vec(mat, vec, k=1, normalize=True, return_vals=False, xp=np):
     if normalize:
-        mat = mat_normalize(mat)
-        vec = vec_normalize(vec)
+        mat = mat_normalize(mat, xp=xp)
+        vec = vec_normalize(vec, xp=xp)
     cosines = xp.matmul(mat, vec)
 
-    if k==1:
-        # Return the most similar element
-        return xp.argmax(cosines)
+    if k==1:    # Return the most similar element
+        nns = xp.argmax(cosines)
+    else:       # Calculate nearest neighbors
+        nns = xp.argsort(-cosines)[:k]
+    
+    if return_vals:
+        return nns, cosines[nns]
     else:
-        # Calculate nearest neighbors
-        nns = xp.argsort(-cosines)
-        return nns[:5]
+        return nns
+
+def nn_word(word, model, k=10, return_vals=False, xp=np, norm_embed_data=None):
+    if norm_embed_data is None:
+        norm_embed_data = mat_normalize(model.embed.W.data, xp=xp)
+    norm_forw = vec_normalize(model.embed(xp.array([ model.vocab[word] ])).data[0], xp=xp)
+    max_idx = nn_vec(norm_embed_data, norm_forw, k=k, normalize=False, xp=xp, return_vals=return_vals)
+    if return_vals:
+        words = to_sent(max_idx[0], model.unvocab)
+        return words, [round(x, 5) for x in max_idx[1].tolist()]
+    else:
+        words = to_sent(max_idx, model.unvocab)
+        return words
 
 def to_sent(x, unvocab, tokenized=False):
     if type(x) == tuple:
@@ -185,7 +199,7 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate.')
     parser.add_argument('--alpha_decay', type=float, default=0.9998, help='Learning rate decay.')
     parser.add_argument('--grad_clip', type=float, default=5.0, help='Gradient clipping.')
-    parser.add_argument('--use_exp_decay', dest='use_exp_decay', action='store_true', help='Exponential learning rate decay.')
+    parser.add_argument('--exp_decay', type=bool, default=True, help='Exponential learning rate decay.')
     # Output
     parser.add_argument('--out', '-o', default='result', help='Directory to output the result.')
     parser.add_argument('--temp', default='temp', help='Temporary directory.')
@@ -261,6 +275,10 @@ def main():
         n_units=args.rnn_units, embed_size=args.embed_size, hidden_units=args.hidden_units, dropout=args.dropout)
     model.to_device(device) # Copy the model to the device
 
+    # Set the model environment
+    model.vocab = vocab
+    model.unvocab = unvocab
+
     # Setup an optimizer
     base_alpha = args.learning_rate
     optimizer = chainer.optimizers.Adam(alpha=args.learning_rate)
@@ -273,17 +291,27 @@ def main():
     valid_iter = chainer.iterators.SerialIterator(valid, args.batchsize, repeat=False, shuffle=False)
     test_iter = chainer.iterators.SerialIterator(test, args.batchsize, repeat=False, shuffle=False)
 
+    # Log nearest neighbors
+    norm_embed_data = mat_normalize(model.embed.W.data, xp=xp)
+    logger.debug(nn_word('good', model, xp=xp, norm_embed_data=norm_embed_data))
+    logger.debug(nn_word('this', model, xp=xp, norm_embed_data=norm_embed_data))
+    logger.debug(nn_word('that', model, xp=xp, norm_embed_data=norm_embed_data))
+    logger.debug(nn_word('awesome', model, xp=xp, norm_embed_data=norm_embed_data))
+    logger.debug(nn_word('bad', model, xp=xp, norm_embed_data=norm_embed_data))
+    logger.debug(nn_word('wrong', model, xp=xp, norm_embed_data=norm_embed_data))
+
+    # Resume training from a checkpoint
+    if args.resume is not None:
+        # if args.resume.isnumeric():
+        chainer.serializers.load_npz(os.path.join(args.out, 'model_epoch_{}.npz'.format(args.resume)), model)
+        chainer.serializers.load_npz(os.path.join(args.out, 'state_epoch_{}.npz'.format(args.resume)), optimizer)
+        # else:
+        #     logger.error('Can only load checkpoints via specifying epochs.')
+    else:
+        args.resume = 0
+
     # Training phase
     if not args.evaluate:
-        # Resume training from a checkpoint
-        if args.resume is not None:
-            # if args.resume.isnumeric():
-            chainer.serializers.load_npz(os.path.join(args.out, 'model_epoch_{}.npz'.format(args.resume)), model)
-            chainer.serializers.load_npz(os.path.join(args.out, 'state_epoch_{}.npz'.format(args.resume)), optimizer)
-            # else:
-            #     logger.error('Can only load checkpoints via specifying epochs.')
-        else:
-            args.resume = 0
 
         best_valid_acc = -1
         best_valid_epoch = -1
@@ -331,7 +359,7 @@ def main():
 
             # Learning rate decay
             if args.alpha_decay > 0.0:
-                if args.use_exp_decay:
+                if args.exp_decay:
                     optimizer.hyperparam.alpha = (base_alpha) * (args.alpha_decay ** global_step)
                 else:
                     optimizer.hyperparam.alpha *= args.alpha_decay
@@ -355,8 +383,8 @@ def main():
                 logger.info('adv. valid_loss:{:.04f} adv. valid_accuracy:{:.04f}'.format(adv_valid_loss, adv_valid_acc))
 
                 # Evaluation on test data
-                test_loss, test_acc = evaluate_fn(test_iter, device, model)
-                logger.info('test_loss:{:.04f} test_accuracy:{:.04f}'.format(test_loss, test_acc))
+                # test_loss, test_acc = evaluate_fn(test_iter, device, model)
+                # logger.info('test_loss:{:.04f} test_accuracy:{:.04f}'.format(test_loss, test_acc))
                 # adv_loss, adv_acc = evaluate_fn(test_iter, device, model, adversarial=True, epsilon=args.adv_epsilon)
                 # logger.info('adv. test_loss:{:.04f} adv. test_accuracy:{:.04f}'.format(adv_loss, adv_acc))
 
@@ -384,15 +412,23 @@ def main():
     chainer.serializers.load_npz(os.path.join(args.out, 'best_model.npz'), model)
     chainer.serializers.load_npz(os.path.join(args.out, 'best_state.npz'), optimizer)
 
+    norm_embed_data = mat_normalize(model.embed.W.data, xp=xp)
+    logger.debug(nn_word('good', model, xp=xp, norm_embed_data=norm_embed_data))
+    logger.debug(nn_word('this', model, xp=xp, norm_embed_data=norm_embed_data))
+    logger.debug(nn_word('that', model, xp=xp, norm_embed_data=norm_embed_data))
+    logger.debug(nn_word('awesome', model, xp=xp, norm_embed_data=norm_embed_data))
+    logger.debug(nn_word('bad', model, xp=xp, norm_embed_data=norm_embed_data))
+    logger.debug(nn_word('wrong', model, xp=xp, norm_embed_data=norm_embed_data))
+
     # Evaluation
-    valid_loss, valid_acc = evaluate_fn(valid_iter, device, model)
-    logger.info('valid_loss:{:.04f} valid_accuracy:{:.04f}'.format(valid_loss, valid_acc))
-    adv_valid_loss, adv_valid_acc = evaluate_fn(valid_iter, device, model, adversarial=True, epsilon=args.adv_epsilon)
-    logger.info('adv. valid_loss:{:.04f} adv. valid_accuracy:{:.04f}'.format(adv_valid_loss, adv_valid_acc))
-    test_loss, test_acc = evaluate_fn(test_iter, device, model)
-    logger.info('test_loss:{:.04f} test_accuracy:{:.04f}'.format(test_loss, test_acc))
-    adv_loss, adv_acc = evaluate_fn(test_iter, device, model, adversarial=True, epsilon=args.adv_epsilon)
-    logger.info('adv. test_loss:{:.04f} adv. test_accuracy:{:.04f}'.format(adv_loss, adv_acc))
+    # valid_loss, valid_acc = evaluate_fn(valid_iter, device, model)
+    # logger.info('valid_loss:{:.04f} valid_accuracy:{:.04f}'.format(valid_loss, valid_acc))
+    # adv_valid_loss, adv_valid_acc = evaluate_fn(valid_iter, device, model, adversarial=True, epsilon=args.adv_epsilon)
+    # logger.info('adv. valid_loss:{:.04f} adv. valid_accuracy:{:.04f}'.format(adv_valid_loss, adv_valid_acc))
+    # test_loss, test_acc = evaluate_fn(test_iter, device, model)
+    # logger.info('test_loss:{:.04f} test_accuracy:{:.04f}'.format(test_loss, test_acc))
+    # adv_loss, adv_acc = evaluate_fn(test_iter, device, model, adversarial=True, epsilon=args.adv_epsilon)
+    # logger.info('adv. test_loss:{:.04f} adv. test_accuracy:{:.04f}'.format(adv_loss, adv_acc))
 
     # Save vocabulary and model's setting
     if not args.evaluate:
