@@ -1,10 +1,11 @@
-import numpy
+import numpy as np
 
 import chainer
 import chainer.functions as F
 import chainer.links as L
 from chainer import reporter
 
+import utils
 
 def sequence_embed(embed, xs, dropout=0.):
     """Efficient embedding function for variable-length sequences
@@ -28,7 +29,7 @@ def sequence_embed(embed, xs, dropout=0.):
 
     """
     x_len = [len(x) for x in xs]
-    x_section = numpy.cumsum(x_len[:-1])
+    x_section = np.cumsum(x_len[:-1])
     ex = embed(F.concat(xs, axis=0))
     ex = F.dropout(ex, ratio=dropout)
     exs = F.split_axis(ex, x_section, 0)
@@ -77,13 +78,9 @@ class classifierModel(chainer.Chain):
         else:
             exs = sequence_embed(self.embed, xs, self.dropout)
             # exs = [F.dropout(self.embed(x), ratio=self.dropout) for x in xs]
-
         last_h, last_c, ys = self.encoder(None, None, exs)
         assert(last_h.shape == (self.n_layers, len(xs), self.out_units))
-        concat_outputs = last_h[-1]
-        self.encoded = concat_outputs
-        # concat_encodings = F.dropout(self.encoded, ratio=self.dropout)
-        # concat_outputs = self.output(concat_encodings)
+        self.encoded = last_h[-1]
         hidden_outputs = self.hidden(self.encoded)
         hidden_outputs = F.relu(hidden_outputs)
         hidden_outputs = F.dropout(hidden_outputs, ratio=self.dropout)
@@ -96,3 +93,14 @@ class classifierModel(chainer.Chain):
         else:
             return concat_outputs
 
+    def nn_word(self, word, k=10, return_vals=False, xp=np, norm_embed=None):
+        if norm_embed is None:
+            norm_embed = utils.mat_normalize(self.embed.W.data, xp=xp)
+        norm_forw = utils.vec_normalize(self.embed(xp.array([ self.vocab[word] ])).data[0], xp=xp)
+        max_idx = utils.nn_vec(norm_embed, norm_forw, k=k, normalize=False, xp=xp, return_vals=return_vals)
+        if return_vals:
+            words = utils.to_sent(max_idx[0], self.unvocab)
+            return words, [round(x, 5) for x in max_idx[1].tolist()]
+        else:
+            words = utils.to_sent(max_idx, self.unvocab)
+            return words

@@ -25,14 +25,13 @@ from os import listdir
 import logging
 import logging.config
 import random
+import data_utils
+from utils import mat_normalize
 # import pdb; pdb.set_trace()
-
-import utils
 
 def imdb_loader(tempdir, max_vocab_size=None, testing=False, write=True, sato=True):
     '''
     An ugly custom function for loading the IMDB data.
-    (needs os, pickle, text_datasets)
     '''
     pik_file = 'imdb_data.pickle'
 
@@ -47,7 +46,7 @@ def imdb_loader(tempdir, max_vocab_size=None, testing=False, write=True, sato=Tr
 
     else:
         if sato:
-            sato_vocab_obj, sato_dataset, sato_lm_data, sato_t_vocab = utils.load_dataset_imdb(
+            sato_vocab_obj, sato_dataset, sato_lm_data, sato_t_vocab = data_utils.load_dataset_imdb(
                 include_pretrain=1, lower=0,
                 min_count=1, ignore_unk=1,
                 use_semi_data=0, add_labeld_to_unlabel=1)
@@ -140,52 +139,6 @@ def evaluate_fn(eval_iter, device, model, adversarial=False, epsilon=1.0):
     eval_iter.reset()
 
     return np.mean(test_losses), np.mean(test_accuracies)
-
-def vec_normalize(vec, xp=np, epsilon=1e-12):
-    return vec / (xp.linalg.norm(vec) + epsilon)
-
-def mat_normalize(mat, xp=np, epsilon=1e-12):
-    return mat / (xp.linalg.norm(mat, axis=1)[:, xp.newaxis] + epsilon)
-
-def nn_vec(mat, vec, k=1, normalize=True, return_vals=False, xp=np):
-    if normalize:
-        mat = mat_normalize(mat, xp=xp)
-        vec = vec_normalize(vec, xp=xp)
-    cosines = xp.matmul(mat, vec)
-
-    if k==1:    # Return the most similar element
-        nns = xp.argmax(cosines)
-    else:       # Calculate nearest neighbors
-        nns = xp.argsort(-cosines)[:k]
-    
-    if return_vals:
-        return nns, cosines[nns]
-    else:
-        return nns
-
-def nn_word(word, model, k=10, return_vals=False, xp=np, norm_embed_data=None):
-    if norm_embed_data is None:
-        norm_embed_data = mat_normalize(model.embed.W.data, xp=xp)
-    norm_forw = vec_normalize(model.embed(xp.array([ model.vocab[word] ])).data[0], xp=xp)
-    max_idx = nn_vec(norm_embed_data, norm_forw, k=k, normalize=False, xp=xp, return_vals=return_vals)
-    if return_vals:
-        words = to_sent(max_idx[0], model.unvocab)
-        return words, [round(x, 5) for x in max_idx[1].tolist()]
-    else:
-        words = to_sent(max_idx, model.unvocab)
-        return words
-
-def to_sent(x, unvocab, tokenized=False):
-    if type(x) == tuple:
-        return to_sent(x[0], unvocab, tokenized)
-    if type(x) == list:
-        toks = [unvocab[w] for w in x]
-        if tokenized:
-            return toks
-        else:
-            return ' '.join(toks)
-    return to_sent(x.tolist(), unvocab, tokenized)
-
 
 def main():
 
@@ -292,13 +245,13 @@ def main():
     test_iter = chainer.iterators.SerialIterator(test, args.batchsize, repeat=False, shuffle=False)
 
     # Log nearest neighbors
-    norm_embed_data = mat_normalize(model.embed.W.data, xp=xp)
-    logger.debug(nn_word('good', model, xp=xp, norm_embed_data=norm_embed_data))
-    logger.debug(nn_word('this', model, xp=xp, norm_embed_data=norm_embed_data))
-    logger.debug(nn_word('that', model, xp=xp, norm_embed_data=norm_embed_data))
-    logger.debug(nn_word('awesome', model, xp=xp, norm_embed_data=norm_embed_data))
-    logger.debug(nn_word('bad', model, xp=xp, norm_embed_data=norm_embed_data))
-    logger.debug(nn_word('wrong', model, xp=xp, norm_embed_data=norm_embed_data))
+    norm_embed = mat_normalize(model.embed.W.data, xp=xp)
+    logger.debug('good: ' + model.nn_word('good', xp=xp, norm_embed=norm_embed))
+    logger.debug('this: ' + model.nn_word('this', xp=xp, norm_embed=norm_embed))
+    logger.debug('that: ' + model.nn_word('that', xp=xp, norm_embed=norm_embed))
+    logger.debug('awesome: ' + model.nn_word('awesome', xp=xp, norm_embed=norm_embed))
+    logger.debug('bad: ' + model.nn_word('bad', xp=xp, norm_embed=norm_embed))
+    logger.debug('wrong: ' + model.nn_word('wrong', xp=xp, norm_embed=norm_embed))
 
     # Resume training from a checkpoint
     if args.resume is not None:
@@ -412,13 +365,13 @@ def main():
     chainer.serializers.load_npz(os.path.join(args.out, 'best_model.npz'), model)
     chainer.serializers.load_npz(os.path.join(args.out, 'best_state.npz'), optimizer)
 
-    norm_embed_data = mat_normalize(model.embed.W.data, xp=xp)
-    logger.debug(nn_word('good', model, xp=xp, norm_embed_data=norm_embed_data))
-    logger.debug(nn_word('this', model, xp=xp, norm_embed_data=norm_embed_data))
-    logger.debug(nn_word('that', model, xp=xp, norm_embed_data=norm_embed_data))
-    logger.debug(nn_word('awesome', model, xp=xp, norm_embed_data=norm_embed_data))
-    logger.debug(nn_word('bad', model, xp=xp, norm_embed_data=norm_embed_data))
-    logger.debug(nn_word('wrong', model, xp=xp, norm_embed_data=norm_embed_data))
+    norm_embed = mat_normalize(model.embed.W.data, xp=xp)
+    logger.debug('good: ' + model.nn_word('good', xp=xp, norm_embed=norm_embed))
+    logger.debug('this: ' + model.nn_word('this', xp=xp, norm_embed=norm_embed))
+    logger.debug('that: ' + model.nn_word('that', xp=xp, norm_embed=norm_embed))
+    logger.debug('awesome: ' + model.nn_word('awesome', xp=xp, norm_embed=norm_embed))
+    logger.debug('bad: ' + model.nn_word('bad', xp=xp, norm_embed=norm_embed))
+    logger.debug('wrong: ' + model.nn_word('wrong', xp=xp, norm_embed=norm_embed))
 
     # Evaluation
     # valid_loss, valid_acc = evaluate_fn(valid_iter, device, model)
