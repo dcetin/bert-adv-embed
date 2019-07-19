@@ -97,7 +97,7 @@ def adv_FGSM(model, test_x, test_y, epsilon=1.0, norm='l2'):
     prediction_test = model(embed_x, feed_embed=True)
     loss_test = F.softmax_cross_entropy(prediction_test, test_y, normalize=True)
     model.cleargrads()
-    adv_g = chainer.grad([loss_test], model.embed_inputs)
+    adv_g = chainer.grad([loss_test], model.embedded)
 
     if norm == 'l2':        # L_2-norm constraint
         adv_p = [epsilon * F.normalize(x, axis=1) for x in adv_g]
@@ -295,7 +295,8 @@ def main():
             train_accuracies.append(accuracy.array)
 
             # Adversarial training
-            if args.adv_train:
+            # currently skips the adversarial stuff on first epoch to learn useful representations
+            if args.adv_train and train_iter.epoch > 1:
                 perturbed = adv_FGSM(model, train_x, train_y, epsilon=args.adv_epsilon)
                 prediction_train = model(perturbed, feed_embed=True)
                 loss_adv = F.softmax_cross_entropy(prediction_train, train_y, normalize=True)

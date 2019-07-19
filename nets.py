@@ -12,7 +12,7 @@ class classifierModel(chainer.Chain):
     """A classifier using a LSTM-RNN Encoder with Word Embedding.
       This model encodes a sentence sequentially using LSTM. and classifies it into classes.
 
-     Args:
+    Args:
         n_class (int): The number of classes to be predicted.
         n_layers (int): The number of LSTM layers.
         n_vocab (int): The size of vocabulary.
@@ -42,13 +42,19 @@ class classifierModel(chainer.Chain):
             w.b1.data[:] = 1.0
             w.b5.data[:] = 1.0
 
-    # Forward step
+    # 
     def __call__(self, xs, softmax=False, argmax=False, feed_embed=False, return_embed=False):
+        """
+        Forward step
+        Args:
+            xs (list): List of ndarray, each containing sequence of vocab. indices.
+            softmax (bool): Return softmax result instead of logits.
+            argmax (bool): Return the predicted classes.
+            feed_embed (bool): Feed continuous embeddings rather than discrete indices as input.
+            return_embed (bool): Return embedding output instead of final classifier output.
+        """
         if feed_embed:
-            self.embed_inputs = xs
-            self.embedded = [F.dropout(x, ratio=self.dropout) for x in xs]
-            # self.embedded = xs
-            # self.embed_inputs = self.embedded
+            self.embedded = xs
         else:
             # Efficient embedding function for variable-length sequences:
             # equal to [F.dropout(self.embed(x), ratio=self.dropout) for x in xs]
