@@ -7,34 +7,6 @@ from chainer import reporter
 
 import utils
 
-def sequence_embed(embed, xs, dropout=0.):
-    """Efficient embedding function for variable-length sequences
-
-    This output is equally to
-    "return [F.dropout(embed(x), ratio=dropout) for x in xs]".
-    However, calling the functions is one-shot and faster.
-
-    Args:
-        embed (callable): A :func:`~chainer.functions.embed_id` function
-            or :class:`~chainer.links.EmbedID` link.
-        xs (list of :class:`~chainer.Variable` or :class:`numpy.ndarray` or \
-        :class:`cupy.ndarray`): i-th element in the list is an input variable,
-            which is a :math:`(L_i, )`-shaped int array.
-        dropout (float): Dropout ratio.
-
-    Returns:
-        list of ~chainer.Variable: Output variables. i-th element in the
-        list is an output variable, which is a :math:`(L_i, N)`-shaped
-        float array. :math:`(N)` is the number of dimensions of word embedding.
-
-    """
-    x_len = [len(x) for x in xs]
-    x_section = np.cumsum(x_len[:-1])
-    ex = embed(F.concat(xs, axis=0))
-    ex = F.dropout(ex, ratio=dropout)
-    exs = F.split_axis(ex, x_section, 0)
-    return exs
-
 class classifierModel(chainer.Chain):
 
     """A classifier using a LSTM-RNN Encoder with Word Embedding.
@@ -71,14 +43,25 @@ class classifierModel(chainer.Chain):
             w.b5.data[:] = 1.0
 
     # Forward step
-    def __call__(self, xs, softmax=False, argmax=False, feed_embed=False):
+    def __call__(self, xs, softmax=False, argmax=False, feed_embed=False, return_embed=False):
         if feed_embed:
             self.embed_inputs = xs
-            exs = [F.dropout(x, ratio=self.dropout) for x in xs]
+            self.embedded = [F.dropout(x, ratio=self.dropout) for x in xs]
+            # self.embedded = xs
+            # self.embed_inputs = self.embedded
         else:
-            exs = sequence_embed(self.embed, xs, self.dropout)
-            # exs = [F.dropout(self.embed(x), ratio=self.dropout) for x in xs]
-        last_h, last_c, ys = self.encoder(None, None, exs)
+            # Efficient embedding function for variable-length sequences:
+            # equal to [F.dropout(self.embed(x), ratio=self.dropout) for x in xs]
+            x_len = [len(x) for x in xs]
+            x_section = np.cumsum(x_len[:-1])
+            ex = self.embed(F.concat(xs, axis=0))
+            ex = F.dropout(ex, ratio=self.dropout)
+            self.embedded = F.split_axis(ex, x_section, 0)
+
+        if return_embed:
+            return self.embedded
+
+        last_h, last_c, ys = self.encoder(None, None, self.embedded)
         assert(last_h.shape == (self.n_layers, len(xs), self.out_units))
         self.encoded = last_h[-1]
         hidden_outputs = self.hidden(self.encoded)
@@ -93,10 +76,19 @@ class classifierModel(chainer.Chain):
         else:
             return concat_outputs
 
-    def nn_word(self, word, k=10, return_vals=False, xp=np, norm_embed=None):
+    def get_nn(self, inp, k=10, return_vals=False, xp=np, norm_embed=None):
         if norm_embed is None:
             norm_embed = utils.mat_normalize(self.embed.W.data, xp=xp)
-        norm_forw = utils.vec_normalize(self.embed(xp.array([ self.vocab[word] ])).data[0], xp=xp)
+
+        if type(inp) == str:            # input is a word
+            norm_forw = utils.vec_normalize(self.embed(xp.array([self.vocab[inp]])).data[0], xp=xp)
+        elif type(inp) == int:          # input is a vocabulary index
+            norm_forw = utils.vec_normalize(self.embed(xp.array([inp])).data[0], xp=xp)
+        elif type(inp) == xp.ndarray:   # input is an embedding vector
+            norm_forw = utils.vec_normalize(inp, xp=xp)
+        else:
+            logger.error('Unsupported input format for nearest neighbors.')
+        
         max_idx = utils.nn_vec(norm_embed, norm_forw, k=k, normalize=False, xp=xp, return_vals=return_vals)
         if return_vals:
             words = utils.to_sent(max_idx[0], self.unvocab)
@@ -104,3 +96,4 @@ class classifierModel(chainer.Chain):
         else:
             words = utils.to_sent(max_idx, self.unvocab)
             return words
+

@@ -20,14 +20,15 @@ import chainer.functions as F
 import numpy as np
 import sys
 import pickle
-from nets import sequence_embed
 from os import listdir
 import logging
 import logging.config
 import random
 import data_utils
 from utils import mat_normalize
+
 # import pdb; pdb.set_trace()
+import time
 
 def imdb_loader(tempdir, max_vocab_size=None, testing=False, write=True, sato=True):
     '''
@@ -92,7 +93,7 @@ def adv_FGSM(model, test_x, test_y, epsilon=1.0, norm='l2'):
     '''
     Applies FGSM on embeddings once.
     '''
-    embed_x = sequence_embed(model.embed, test_x, model.dropout)
+    embed_x = model(test_x, return_embed=True)
     prediction_test = model(embed_x, feed_embed=True)
     loss_test = F.softmax_cross_entropy(prediction_test, test_y, normalize=True)
     model.cleargrads()
@@ -104,9 +105,10 @@ def adv_FGSM(model, test_x, test_y, epsilon=1.0, norm='l2'):
         adv_p = [epsilon * F.sign(x) for x in adv_g]
 
     perturbed = [x+p for x, p in zip(embed_x, adv_p)]
-    return perturbed
+    perturbed_data = [x.data for x in perturbed]
+    return perturbed_data
 
-def evaluate_fn(eval_iter, device, model, adversarial=False, epsilon=1.0):
+def evaluate_fn(eval_iter, device, model, adversarial=False, epsilon=1.0, xp=np):
     '''
     Evaluates the model on one epoch of the iterator.Supports standard and adversarial evaluation.
     '''
@@ -119,12 +121,12 @@ def evaluate_fn(eval_iter, device, model, adversarial=False, epsilon=1.0):
         test_y = F.concat(test_y, axis=0)
 
         if adversarial:
-            test_x = adv_FGSM(model, test_x, test_y, epsilon)
+            adv_test_x = adv_FGSM(model, test_x, test_y, epsilon)
 
         with chainer.using_config('train', False):
             # Forward the test data
             if adversarial: # Adversarial evaluation
-                prediction_test = model(test_x, feed_embed=True)
+                prediction_test = model(adv_test_x, feed_embed=True)
             else: # Standard evaluation
                 prediction_test = model(test_x)
             # Calculate the loss
@@ -231,6 +233,7 @@ def main():
     # Set the model environment
     model.vocab = vocab
     model.unvocab = unvocab
+    model.logger = logger
 
     # Setup an optimizer
     base_alpha = args.learning_rate
@@ -245,13 +248,10 @@ def main():
     test_iter = chainer.iterators.SerialIterator(test, args.batchsize, repeat=False, shuffle=False)
 
     # Log nearest neighbors
-    norm_embed = mat_normalize(model.embed.W.data, xp=xp)
-    logger.debug('good: ' + model.nn_word('good', xp=xp, norm_embed=norm_embed))
-    logger.debug('this: ' + model.nn_word('this', xp=xp, norm_embed=norm_embed))
-    logger.debug('that: ' + model.nn_word('that', xp=xp, norm_embed=norm_embed))
-    logger.debug('awesome: ' + model.nn_word('awesome', xp=xp, norm_embed=norm_embed))
-    logger.debug('bad: ' + model.nn_word('bad', xp=xp, norm_embed=norm_embed))
-    logger.debug('wrong: ' + model.nn_word('wrong', xp=xp, norm_embed=norm_embed))
+    # norm_embed = mat_normalize(model.embed.W.data, xp=xp)
+    # logger.debug('good: ' + model.nn_word('good', xp=xp, norm_embed=norm_embed))
+    # logger.debug('that: ' + model.nn_word('that', xp=xp, norm_embed=norm_embed))
+    # logger.debug('bad: ' + model.nn_word('bad', xp=xp, norm_embed=norm_embed))
 
     # Resume training from a checkpoint
     if args.resume is not None:
@@ -265,7 +265,6 @@ def main():
 
     # Training phase
     if not args.evaluate:
-
         best_valid_acc = -1
         best_valid_epoch = -1
         train_accuracies = []
@@ -330,15 +329,15 @@ def main():
                 logger.info('alpha:{:.04f} global_step:{:.04f} '.format(optimizer.hyperparam.alpha, global_step))
 
                 # Evaluation on validation data
-                valid_loss, valid_acc = evaluate_fn(valid_iter, device, model)
+                valid_loss, valid_acc = evaluate_fn(valid_iter, device, model, xp=xp)
                 logger.info('valid_loss:{:.04f} valid_accuracy:{:.04f}'.format(valid_loss, valid_acc))
-                adv_valid_loss, adv_valid_acc = evaluate_fn(valid_iter, device, model, adversarial=True, epsilon=args.adv_epsilon)
+                adv_valid_loss, adv_valid_acc = evaluate_fn(valid_iter, device, model, adversarial=True, epsilon=args.adv_epsilon, xp=xp)
                 logger.info('adv. valid_loss:{:.04f} adv. valid_accuracy:{:.04f}'.format(adv_valid_loss, adv_valid_acc))
 
                 # Evaluation on test data
-                # test_loss, test_acc = evaluate_fn(test_iter, device, model)
+                # test_loss, test_acc = evaluate_fn(test_iter, device, model, xp=xp)
                 # logger.info('test_loss:{:.04f} test_accuracy:{:.04f}'.format(test_loss, test_acc))
-                # adv_loss, adv_acc = evaluate_fn(test_iter, device, model, adversarial=True, epsilon=args.adv_epsilon)
+                # adv_loss, adv_acc = evaluate_fn(test_iter, device, model, adversarial=True, epsilon=args.adv_epsilon, xp=xp)
                 # logger.info('adv. test_loss:{:.04f} adv. test_accuracy:{:.04f}'.format(adv_loss, adv_acc))
 
                 logger.info('\n')
@@ -365,22 +364,20 @@ def main():
     chainer.serializers.load_npz(os.path.join(args.out, 'best_model.npz'), model)
     chainer.serializers.load_npz(os.path.join(args.out, 'best_state.npz'), optimizer)
 
-    norm_embed = mat_normalize(model.embed.W.data, xp=xp)
-    logger.debug('good: ' + model.nn_word('good', xp=xp, norm_embed=norm_embed))
-    logger.debug('this: ' + model.nn_word('this', xp=xp, norm_embed=norm_embed))
-    logger.debug('that: ' + model.nn_word('that', xp=xp, norm_embed=norm_embed))
-    logger.debug('awesome: ' + model.nn_word('awesome', xp=xp, norm_embed=norm_embed))
-    logger.debug('bad: ' + model.nn_word('bad', xp=xp, norm_embed=norm_embed))
-    logger.debug('wrong: ' + model.nn_word('wrong', xp=xp, norm_embed=norm_embed))
+    # Log nearest neighbors
+    # norm_embed = mat_normalize(model.embed.W.data, xp=xp)
+    # logger.debug('good: ' + model.nn_word('good', xp=xp, norm_embed=norm_embed))
+    # logger.debug('that: ' + model.nn_word('that', xp=xp, norm_embed=norm_embed))
+    # logger.debug('bad: ' + model.nn_word('bad', xp=xp, norm_embed=norm_embed))
 
     # Evaluation
-    # valid_loss, valid_acc = evaluate_fn(valid_iter, device, model)
-    # logger.info('valid_loss:{:.04f} valid_accuracy:{:.04f}'.format(valid_loss, valid_acc))
-    # adv_valid_loss, adv_valid_acc = evaluate_fn(valid_iter, device, model, adversarial=True, epsilon=args.adv_epsilon)
-    # logger.info('adv. valid_loss:{:.04f} adv. valid_accuracy:{:.04f}'.format(adv_valid_loss, adv_valid_acc))
-    # test_loss, test_acc = evaluate_fn(test_iter, device, model)
+    valid_loss, valid_acc = evaluate_fn(valid_iter, device, model, xp=xp)
+    logger.info('valid_loss:{:.04f} valid_accuracy:{:.04f}'.format(valid_loss, valid_acc))
+    adv_valid_loss, adv_valid_acc = evaluate_fn(valid_iter, device, model, adversarial=True, epsilon=args.adv_epsilon, xp=xp)
+    logger.info('adv. valid_loss:{:.04f} adv. valid_accuracy:{:.04f}'.format(adv_valid_loss, adv_valid_acc))
+    # test_loss, test_acc = evaluate_fn(test_iter, device, model, xp=xp)
     # logger.info('test_loss:{:.04f} test_accuracy:{:.04f}'.format(test_loss, test_acc))
-    # adv_loss, adv_acc = evaluate_fn(test_iter, device, model, adversarial=True, epsilon=args.adv_epsilon)
+    # adv_loss, adv_acc = evaluate_fn(test_iter, device, model, adversarial=True, epsilon=args.adv_epsilon, xp=xp)
     # logger.info('adv. test_loss:{:.04f} adv. test_accuracy:{:.04f}'.format(adv_loss, adv_acc))
 
     # Save vocabulary and model's setting
