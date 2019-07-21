@@ -82,7 +82,7 @@ class classifierModel(chainer.Chain):
         else:
             return concat_outputs
 
-    def get_nn(self, inp, k=10, return_vals=False, xp=np, norm_embed=None):
+    def get_vec_nn(self, inp, k=10, return_vals=False, norm_embed=None, xp=np):
         if norm_embed is None:
             norm_embed = utils.mat_normalize(self.embed.W.data, xp=xp)
 
@@ -102,4 +102,17 @@ class classifierModel(chainer.Chain):
         else:
             words = utils.to_sent(max_idx, self.unvocab)
             return words
+
+    def get_seq_nn(self, seq, norm_embed=None, project=False, xp=np):
+        if norm_embed is None:
+            norm_embed = utils.mat_normalize(self.embed.W.data, xp=xp)
+        seq_norm = utils.mat_normalize(seq, xp=xp)
+        seq_nn = xp.matmul(norm_embed, seq_norm.T)
+        seq_nn = xp.argmax(seq_nn, axis=0)
+
+        if project:
+            units = norm_embed[seq_nn]
+            return xp.multiply(units, seq)
+        else:
+            return utils.to_sent(seq_nn, self.unvocab)
 

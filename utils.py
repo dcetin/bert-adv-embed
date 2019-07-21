@@ -9,6 +9,8 @@ def to_sent(x, unvocab, tokenized=False):
             return toks
         else:
             return ' '.join(toks)
+    if type(x) == int:
+        return to_sent([x], unvocab, tokenized)
     return to_sent(x.tolist(), unvocab, tokenized)
 
 def vec_normalize(vec, xp=np, epsilon=1e-12):
