@@ -6,6 +6,7 @@ import chainer.links as L
 from chainer import reporter
 
 import utils
+import pickle
 
 class classifierModel(chainer.Chain):
 
@@ -42,7 +43,7 @@ class classifierModel(chainer.Chain):
             w.b1.data[:] = 1.0
             w.b5.data[:] = 1.0
 
-    # 
+
     def __call__(self, xs, softmax=False, argmax=False, feed_embed=False, return_embed=False):
         """
         Forward step
@@ -82,9 +83,10 @@ class classifierModel(chainer.Chain):
         else:
             return concat_outputs
 
+
     def get_vec_nn(self, inp, k=10, return_vals=False, norm_embed=None, xp=np):
         if norm_embed is None:
-            norm_embed = utils.mat_normalize(self.embed.W.data, xp=xp)
+            norm_embed = self.get_norm_embed(xp=xp)
 
         if type(inp) == str:            # input is a word
             norm_forw = utils.vec_normalize(self.embed(xp.array([self.vocab[inp]])).data[0], xp=xp)
@@ -103,9 +105,10 @@ class classifierModel(chainer.Chain):
             words = utils.to_sent(max_idx, self.unvocab)
             return words
 
+
     def get_seq_nn(self, seq, norm_embed=None, project=False, xp=np):
         if norm_embed is None:
-            norm_embed = utils.mat_normalize(self.embed.W.data, xp=xp)
+            norm_embed = self.get_norm_embed(xp=xp)
         seq_norm = utils.mat_normalize(seq, xp=xp)
         seq_nn = xp.matmul(norm_embed, seq_norm.T)
         seq_nn = xp.argmax(seq_nn, axis=0)
@@ -115,4 +118,45 @@ class classifierModel(chainer.Chain):
             return xp.multiply(units, seq)
         else:
             return utils.to_sent(seq_nn, self.unvocab)
+
+
+    def load_pretrained(self, weights, embeds=True, lstm=True):
+        
+        with open(weights, 'rb') as handle:
+            W_data = pickle.load(handle)
+            source_w = pickle.load(handle)
+            source_b = pickle.load(handle)
+
+        if embeds:
+            limit = self.embed.W.shape[0]
+            W_data = self.xp.array(W_data)
+            self.embed.W.data[:] = W_data[:limit]
+
+        if lstm:
+            w = self.encoder[0]
+
+            # [NStepLSTM]
+            # w0, w4 : input gate   (i)
+            # w1, w5 : forget gate  (f)
+            # w2, w6 : new memory gate (c)
+            # w3, w7 : output gate
+
+            # [Chaner LSTM]
+            # a,   :   w2, w6
+            # i,   :   w0, w4
+            # f,   :   w1, w5
+            # o    :   w3, w7
+
+            uni_lstm_w = [w.w2, w.w0, w.w1, w.w3, w.w6, w.w4, w.w5, w.w7]
+            uni_lstm_b = [w.b2, w.b0, w.b1, w.b3, w.b6, w.b4, w.b5, w.b7]
+
+            for uni_w, pre_w in zip(uni_lstm_w, source_w):
+                uni_w.data[:] = self.xp.array(pre_w.data[:])
+
+            for uni_b, pre_b in zip(uni_lstm_b, source_b):
+                uni_b.data[:] = self.xp.array(pre_b.data[:])
+
+
+    def get_norm_embed(self, xp=np):
+        return utils.mat_normalize(self.embed.W.data, xp=xp)
 

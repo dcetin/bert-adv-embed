@@ -1,42 +1,36 @@
 #!/usr/bin/env python
+
 import argparse
 import datetime
 import json
 import os
-
-import chainer
-from chainer import training
-
-import nets
-from nlp_utils import convert_seq
-import text_datasets
-
-from chainer.training import extensions
-from chainer import serializers
-from chainer.dataset import concat_examples
-from chainer.backends import cuda
-from chainer.backends.cuda import to_cpu
-import chainer.functions as F
-import numpy as np
 import sys
 import pickle
-from os import listdir
+import random
 import logging
 import logging.config
-import random
+import numpy as np
+
+import chainer
+import chainer.functions as F
+from chainer import serializers
+from chainer.backends import cuda
+from chainer.backends.cuda import to_cpu
+
+import nets
 import data_utils
-from utils import mat_normalize
+from visualize import create_plots
 
 # import pdb; pdb.set_trace()
-import time
+import text_datasets
 
-def imdb_loader(tempdir, max_vocab_size=None, testing=False, write=True, sato=True):
+def imdb_loader(tempdir, max_vocab_size=None, testing=False, cache=True, sato=True):
     '''
     An ugly custom function for loading the IMDB data.
     '''
     pik_file = 'imdb_data.pickle'
 
-    if os.path.exists(os.path.join(tempdir, pik_file)):
+    if cache and os.path.exists(os.path.join(tempdir, pik_file)):
         with open(os.path.join(tempdir, pik_file), 'rb') as handle:
             train = pickle.load(handle)
             valid = pickle.load(handle)
@@ -60,20 +54,21 @@ def imdb_loader(tempdir, max_vocab_size=None, testing=False, write=True, sato=Tr
             sato_vocab_inv = dict([(widx, w) for w, widx in sato_vocab.items()])
             # print('vocab_inv:', len(sato_vocab_inv))
 
-            train = list(zip(sato_train_x, [np.asarray([x]) for x in sato_train_y]))
-            valid = list(zip(sato_dev_x, [np.asarray([x]) for x in sato_dev_y]))
-            test = list(zip(sato_test_x, [np.asarray([x]) for x in sato_test_y]))
+            train = list(zip(sato_train_x, sato_train_y))
+            valid = list(zip(sato_dev_x, sato_dev_y))
+            test = list(zip(sato_test_x, sato_test_y))
             vocab = sato_vocab
             unsup = sato_semi_train_x
 
         else:
+            # (e.g. max_vocab_size=20000 for a small vocab)
             train, valid, test, unsup, vocab = text_datasets.get_imdb(fine_grained=False, char_based=False, max_vocab_size=None)
 
         unvocab = {}
         for key, value in vocab.items():
             unvocab[value] = key
 
-        if write and testing is False:
+        if cache and testing is False:
             with open(os.path.join(tempdir, pik_file), 'wb') as handle:
                 pickle.dump(train, handle, protocol=pickle.HIGHEST_PROTOCOL)
                 pickle.dump(valid, handle, protocol=pickle.HIGHEST_PROTOCOL)
@@ -134,35 +129,46 @@ def evaluate_fn(eval_iter, device, model, adversarial=False, epsilon=5.0, xp=np)
     '''
     Evaluates the model on one epoch of the iterator.Supports standard and adversarial evaluation.
     '''
-    test_losses = []
-    test_accuracies = []
-    for test_batch in eval_iter:
-        test_data = convert_seq(test_batch, device)
-        test_x = test_data['xs']
-        test_y = test_data['ys']
-        test_y = F.concat(test_y, axis=0)
+    eval_losses = []
+    eval_accuracies = []
+    for eval_batch in eval_iter:
+        eval_batch = eval_iter.next()
+        eval_x, eval_y = map(list, zip(*eval_batch))
+        eval_x = [chainer.dataset.to_device(device, x) for x in eval_x]
+        eval_y = chainer.dataset.to_device(device, xp.asarray(eval_y))
 
         if adversarial:
-            adv_test_x = adv_FGSM(model, test_x, test_y, epsilon, train=False)
+            adv_eval_x = adv_FGSM(model, eval_x, eval_y, epsilon, train=False)
 
         with chainer.using_config('train', False):
-            # Forward the test data
+            # Forward the eval data
             if adversarial: # Adversarial evaluation
-                prediction_test = model(adv_test_x, feed_embed=True)
+                prediction_eval = model(adv_eval_x, feed_embed=True)
             else: # Standard evaluation
-                prediction_test = model(test_x)
+                prediction_eval = model(eval_x)
             # Calculate the loss
-            loss_test = F.softmax_cross_entropy(prediction_test, test_y, normalize=True)
-            test_losses.append(to_cpu(loss_test.array))
+            loss_eval = F.softmax_cross_entropy(prediction_eval, eval_y, normalize=True)
+            eval_losses.append(to_cpu(loss_eval.array))
 
             # Calculate the accuracy
-            accuracy = F.accuracy(prediction_test, test_y)
+            accuracy = F.accuracy(prediction_eval, eval_y)
             accuracy.to_cpu()
-            test_accuracies.append(accuracy.array)
+            eval_accuracies.append(accuracy.array)
 
     eval_iter.reset()
 
-    return np.mean(test_losses), np.mean(test_accuracies)
+    return np.mean(eval_losses), np.mean(eval_accuracies)
+
+def example_nn(model, logger, return_vals=False, xp=np):
+    norm_embed = model.get_norm_embed(xp=xp)
+    for word in ['good', 'this', 'that', 'awesome', 'bad', 'wrong']:
+        if return_vals:
+            nns, vals = model.get_vec_nn(word, xp=xp, norm_embed=norm_embed, return_vals=True)
+            exstr = ' '.join([nn + ' (' + str(val) + ')' for (nn,val) in list(zip(nns.split(' '), vals))])
+            logger.debug(word + ': ' + exstr)
+        else:
+            logger.debug(word + ': ' + model.get_vec_nn(word, xp=xp, norm_embed=norm_embed))
+    logger.debug('\n')
 
 def main():
 
@@ -183,6 +189,9 @@ def main():
     parser.add_argument('--out', '-o', default='result', help='Directory to output the result.')
     parser.add_argument('--temp', default='temp', help='Temporary directory.')
     parser.add_argument('--file_log', type=bool, default=True, help='Logging to file.')
+    # Pretrained model
+    parser.add_argument('--load_pretrained', type=bool, default=True, help='Load the pretrained model.')
+    parser.add_argument('--pretrained_path', default='temp/pretrained.pkl', help='Location of the pretrained weights.')
     # Model
     parser.add_argument('--embed_size', type=int, default=256, help='Size of the embedding layer.')
     parser.add_argument('--rnn_units', type=int, default=1024, help='Number of units of the RNN layer.')
@@ -199,7 +208,9 @@ def main():
     parser.add_argument('--debug', dest='debug', action='store_true', help='Runs Chainer in debug mode.')
     # Checkpointing
     parser.add_argument('--resume', '-r', type=int, default=None, help='Resume the training from snapshot.')
-    parser.add_argument('--evaluate', dest='evaluate', action='store_true', help='Skips training (resume option is ignored).')
+    parser.add_argument('--eval_epoch', type=int, default=0, help='Checkpoint to be evaluated, 0 means best epoch.')
+    parser.add_argument('--evaluate', dest='evaluate', action='store_true', help='Skips training and evaluates the model.')
+    parser.add_argument('--save_all', dest='save_all', action='store_true', help='Saves checkpoint after every epoch.')
     # Device
     group = parser.add_argument_group('deprecated arguments')
     group.add_argument('--gpu', '-g', dest='device', type=int, nargs='?', const=0, help='GPU ID (negative value indicates CPU)')
@@ -213,6 +224,7 @@ def main():
     random.seed(args.random_seed)
     os.environ["CHAINER_SEED"] = str(args.random_seed)
 
+    # Debug mode
     if args.debug:
         chainer.set_debug(True)
 
@@ -233,11 +245,10 @@ def main():
         fh = logging.FileHandler(os.path.join(args.out, 'output.log'))
         fh.setFormatter(logger.handlers[0].formatter)
         logger.addHandler(fh)
-    # logger.info(json.dumps(args.__dict__, indent=2))
     logger.info(args.__dict__)
 
-    # Load data (e.g. max_vocab_size=20000 for a small vocab)
-    train, valid, test, unsup, vocab, unvocab = imdb_loader(args.temp, testing=args.testing)
+    # Load data
+    train, valid, test, unsup, vocab, unvocab = imdb_loader(args.temp, testing=args.testing, cache=False)
     n_class = len(set([int(d[1]) for d in train]))
 
     # Log metadata
@@ -256,21 +267,27 @@ def main():
         #     print('Avg. sequence length:\t', np.average(seqlens))
         # [dataset_stats(x) for x in [train,valid,test,unsup]]
 
-    # Setup the model
+    # Setup the model and copy the model to the device
     model = nets.classifierModel(n_class, n_layers=args.layers, n_vocab=len(vocab),
         n_units=args.rnn_units, embed_size=args.embed_size, hidden_units=args.hidden_units, dropout=args.dropout)
-    model.to_device(device) # Copy the model to the device
+    model.to_device(device)
 
     # Set the model environment
     model.vocab = vocab
     model.unvocab = unvocab
     model.logger = logger
 
+    # Load pretrained embedding and weights
+    if args.load_pretrained:
+        logger.info('Loading pretrained model weights')
+        model.load_pretrained(args.pretrained_path)
+	    # Log nearest neighbors
+	    example_nn(model, logger, xp=xp)
+
     # Setup an optimizer
     base_alpha = args.learning_rate
     optimizer = chainer.optimizers.Adam(alpha=args.learning_rate)
     optimizer.setup(model)
-    # optimizer.add_hook(chainer.optimizer.WeightDecay(1e-4))
     optimizer.add_hook(chainer.optimizer.GradientClipping(args.grad_clip))
     global_step = 0.0
 
@@ -279,27 +296,22 @@ def main():
     valid_iter = chainer.iterators.SerialIterator(valid, args.batchsize, repeat=False, shuffle=False)
     test_iter = chainer.iterators.SerialIterator(test, args.batchsize, repeat=False, shuffle=False)
 
-    # Log nearest neighbors
-    # norm_embed = mat_normalize(model.embed.W.data, xp=xp)
-    # logger.debug('good: ' + model.nn_word('good', xp=xp, norm_embed=norm_embed))
-    # logger.debug('that: ' + model.nn_word('that', xp=xp, norm_embed=norm_embed))
-    # logger.debug('bad: ' + model.nn_word('bad', xp=xp, norm_embed=norm_embed))
-
     # Resume training from a checkpoint
     if args.resume is not None:
-        # if args.resume.isnumeric():
+        logger.info('Loading model checkpoint from epoch {}'.format(args.resume))
         chainer.serializers.load_npz(os.path.join(args.out, 'model_epoch_{}.npz'.format(args.resume)), model)
         chainer.serializers.load_npz(os.path.join(args.out, 'state_epoch_{}.npz'.format(args.resume)), optimizer)
-        # else:
-        #     logger.error('Can only load checkpoints via specifying epochs.')
         if args.resume_lr is True and args.alpha_decay > 0.0:
             global_step = 664.0 * args.resume
             if args.exp_decay:
                 optimizer.hyperparam.alpha = (base_alpha) * (args.alpha_decay ** global_step)
             else:
                 optimizer.hyperparam.alpha *= args.alpha_decay ** args.resume
+        # Log nearest neighbors
+        example_nn(model, logger, xp=xp)
     else:
         args.resume = 0
+
 
     # Training phase
     if not args.evaluate:
@@ -309,7 +321,6 @@ def main():
         train_adv_accuracies = []
         chainer.config.train = True
         logger.info('Started training from epoch: {} \n'.format(args.resume))
-
         model.cleargrads()
 
         # Training loop
@@ -318,10 +329,9 @@ def main():
 
             # Get the training batch
             train_batch = train_iter.next()
-            train_data = convert_seq(train_batch, device)
-            train_x = train_data['xs']
-            train_y = train_data['ys']
-            train_y = F.concat(train_y, axis=0)
+            train_x, train_y = map(list, zip(*train_batch))
+            train_x = [chainer.dataset.to_device(device, x) for x in train_x]
+            train_y = chainer.dataset.to_device(device, xp.asarray(train_y))
 
             # Calculate the prediction and loss of the network
             prediction_train = model(train_x)
@@ -331,7 +341,7 @@ def main():
             train_accuracies.append(accuracy.array)
 
             # Adversarial training
-            # currently skips the adversarial stuff on first epoch to learn useful representations
+            # if args.adv_train:
             if args.adv_train and (args.resume > 0 or train_iter.epoch > 1):
                 perturbed = adv_FGSM(model, train_x, train_y, epsilon=args.adv_epsilon, train=True)
                 prediction_train = model(perturbed, feed_embed=True)
@@ -363,7 +373,6 @@ def main():
                     logger.info('train_adv_accuracy:{:.04f} '.format(np.mean(train_adv_accuracies)))
                 train_accuracies = []
 
-
                 # Evaluation on validation data
                 valid_loss, valid_acc = evaluate_fn(valid_iter, device, model, xp=xp)
                 logger.info('valid_loss:{:.04f} valid_accuracy:{:.04f}'.format(valid_loss, valid_acc))
@@ -379,7 +388,7 @@ def main():
                 logger.info('\n')
 
                 # Checkpointing
-                if valid_acc > best_valid_acc:
+                if args.save_all or valid_acc > best_valid_acc:
                     best_valid_acc = valid_acc
                     best_valid_epoch = train_iter.epoch
                     chainer.serializers.save_npz(os.path.join(args.out, 'model_epoch_{}.npz'.format(train_iter.epoch + args.resume)), model)
@@ -395,24 +404,30 @@ def main():
         chainer.serializers.save_npz(os.path.join(args.out, 'model_epoch_{}.npz'.format(train_iter.epoch + args.resume)), model)
         chainer.serializers.save_npz(os.path.join(args.out, 'state_epoch_{}.npz'.format(train_iter.epoch + args.resume)), optimizer)
 
-    # Load the best checkpoint
-    # logger.info('Loading the model with best validation accuracy from checkpoint {} \n'.format(best_valid_epoch))
-    chainer.serializers.load_npz(os.path.join(args.out, 'best_model.npz'), model)
-    chainer.serializers.load_npz(os.path.join(args.out, 'best_state.npz'), optimizer)
+    # Load the evaluation checkpoint, best is default
+    if args.eval_epoch == 0:
+        logger.info('Loading the model with best valid. accuracy for evaluation')
+        chainer.serializers.load_npz(os.path.join(args.out, 'best_model.npz'), model)
+        chainer.serializers.load_npz(os.path.join(args.out, 'best_state.npz'), optimizer)
+    else:
+        logger.info('Loading model checkpoint from epoch {} for evaluation'.format(args.eval_epoch))
+        chainer.serializers.load_npz(os.path.join(args.out, 'model_epoch_{}.npz'.format(args.eval_epoch)), model)
+        chainer.serializers.load_npz(os.path.join(args.out, 'state_epoch_{}.npz'.format(args.eval_epoch)), optimizer)
 
     # Log nearest neighbors
-    # norm_embed = mat_normalize(model.embed.W.data, xp=xp)
-    # logger.debug('good: ' + model.nn_word('good', xp=xp, norm_embed=norm_embed))
-    # logger.debug('that: ' + model.nn_word('that', xp=xp, norm_embed=norm_embed))
-    # logger.debug('bad: ' + model.nn_word('bad', xp=xp, norm_embed=norm_embed))
+    example_nn(model, logger, xp=xp)
 
     # Playground
-    def projection_demo(model, eval_iter, xp=np):
+    def projection_demo(model, eval_iter, logger, xp=np):
+        num_examples = 0
+        max_examples = 3
+
         for test_batch in eval_iter:
-            test_data = convert_seq(test_batch, device)
-            test_x = test_data['xs']
-            test_y = test_data['ys']
-            test_y = F.concat(test_y, axis=0)
+            test_batch = test_iter.next()
+            test_x, test_y = map(list, zip(*test_batch))
+            test_x = [chainer.dataset.to_device(device, x) for x in test_x]
+            test_y = chainer.dataset.to_device(device, xp.asarray(test_y))
+
             adv_test_x = adv_FGSM(model, test_x, test_y, train=False)
 
             with chainer.using_config('train', False):
@@ -425,56 +440,60 @@ def main():
                 res = ~adv & std
                 res_ids = xp.where(res.astype(int) == 1)[0].tolist()
 
-                # print('groundtruth:', test_y.data)
-                # print('predictions:', prediction_test)
-                # print('adv.  preds:', prediction_adv_test)
-                # print('std:', std.astype(int))
-                # print('adv:', adv.astype(int))
-                # print('res:', res.astype(int))
-                # print('std acc:', std.mean())
-                # print('adv acc:', adv.mean())
+                # logger.debug('groundtruth: {}'.format(test_y.data))
+                # logger.debug('predictions: {}'.format(prediction_test))
+                # logger.debug('adv.  preds: {}'.format(prediction_adv_test))
+                # logger.debug('std: {}'.format(std.astype(int)))
+                # logger.debug('adv: {}'.format(adv.astype(int)))
+                # logger.debug('res: {}'.format(res.astype(int)))
+                # logger.debug('std acc: {}'.format(std.mean()))
+                # logger.debug('adv acc: {}'.format(adv.mean()))
 
                 # Iterate over all adversarial sequences, or pick the shortest one
-                shortest = min(res_ids, key=lambda x:int(test_x[x].size))
-                for seq_idx in [shortest]:
+                if len(res_ids) > 0:
+                    shortest = min(res_ids, key=lambda x:int(test_x[x].size))
+                    for seq_idx in [shortest]:
 
-                    # Iterate until finding a sufficiently short sequence
-                    # if test_x[seq_idx].size > 10:
-                    #     continue
+                        # Iterate until finding a sufficiently short sequence
+                        if test_x[seq_idx].size > 20:
+                            continue
 
-                    print('seq_idx:', seq_idx, 'of length', test_x[seq_idx].size)
+                        logger.debug('seq_idx: {} of length {}'.format(seq_idx, test_x[seq_idx].size))
 
-                    # Vectorised version
-                    norm_embed = mat_normalize(model.embed.W.data, xp=xp)
+                        # Vectorised version
+                        norm_embed = model.get_norm_embed(xp=xp)
 
-                    emb = embed_x[seq_idx]
-                    emb_nn = model.get_seq_nn(emb, norm_embed=norm_embed, xp=xp)
-                    emb_norm = xp.linalg.norm(emb, axis=1).tolist()
+                        emb = embed_x[seq_idx]
+                        emb_nn = model.get_seq_nn(emb, norm_embed=norm_embed, xp=xp)
+                        emb_norm = xp.linalg.norm(emb, axis=1).tolist()
 
-                    adv = adv_test_x[seq_idx]
-                    adv_nn = model.get_seq_nn(adv, norm_embed=norm_embed, xp=xp)
-                    adv_norm = xp.linalg.norm(adv, axis=1).tolist()
+                        adv = adv_test_x[seq_idx]
+                        adv_nn = model.get_seq_nn(adv, norm_embed=norm_embed, xp=xp)
+                        adv_norm = xp.linalg.norm(adv, axis=1).tolist()
 
-                    per = adv-emb
-                    per_nn = model.get_seq_nn(per, norm_embed=norm_embed, xp=xp)
-                    per_norm = xp.linalg.norm(per, axis=1).tolist()
+                        per = adv-emb
+                        per_nn = model.get_seq_nn(per, norm_embed=norm_embed, xp=xp)
+                        per_norm = xp.linalg.norm(per, axis=1).tolist()
 
-                    print(emb_nn)
-                    print(adv_nn)
-                    print(per_nn)
-                    print(emb_norm)
-                    print(adv_norm)
-                    print(per_norm)
+                        logger.debug(emb_nn)
+                        logger.debug(adv_nn)
+                        logger.debug(per_nn)
+                        logger.debug(emb_norm)
+                        logger.debug(adv_norm)
+                        logger.debug(per_norm)
+                        logger.debug('\n')
 
-                    from visualize import create_plots
-                    data = emb_nn, adv_nn, per_nn, emb_norm, adv_norm, per_norm
-                    name = str(eval_iter.current_position) + '_' + str(seq_idx)
-                    create_plots(data, name)
-            
-            break
+                        data = emb_nn, adv_nn, per_nn, emb_norm, adv_norm, per_norm
+                        name = str(eval_iter.current_position) + '_' + str(seq_idx)
+                        create_plots(data, name, folder=args.out)
+
+                        num_examples += 1
+
+                        if num_examples >= max_examples:
+                            return
 
         eval_iter.reset()
-    # projection_demo(model, test_iter, xp=xp)
+    projection_demo(model, test_iter, logger, xp=xp)
 
     # Evaluation
     valid_loss, valid_acc = evaluate_fn(valid_iter, device, model, xp=xp)
