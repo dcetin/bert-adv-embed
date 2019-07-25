@@ -39,27 +39,35 @@ def process_data(data):
     emb_nn, adv_nn, per_nn = np.asarray(emb_nn), np.asarray(adv_nn), np.asarray(per_nn)
     return emb_nn, adv_nn, per_nn, emb_norm, adv_norm, per_norm
 
-def create_plots(data, name, folder='temp'):
+def create_plots(data, metadata, folder='temp'):
     emb_nn, adv_nn, per_nn, emb_norm, adv_norm, per_norm = process_data(data)
     annot_nn = np.stack([emb_nn, per_nn, adv_nn], axis=1)
     df = pd.DataFrame({'original': emb_norm, 'perturbation': per_norm, 'adversarial': adv_norm}, index=np.arange(emb_norm.size))
     df = df[['original', 'perturbation', 'adversarial']]
     vmin = math.floor(df.values.min())
     vmax = math.ceil(df.values.max())
+
+    size_h = emb_nn.size / 4.0
+    size_w = 8
+
+    plt.figure(figsize=(size_w, size_h))
     nn_plot = sns.heatmap(df, annot=annot_nn, fmt='', cmap='YlOrRd', vmin=vmin, vmax=vmax)
     nn_plot.set_xticklabels(nn_plot.get_xticklabels(), rotation=0)
-    plt.title('Nearest neighbors')
-    plt.savefig(os.path.join(folder, name + '_nns.png'))
+    plt.title(r'Nearest neighbors, $\epsilon = $' + metadata['epsilon'])
+    plt.savefig(os.path.join(folder, metadata['name'] + '_nns.png'))
     plt.clf()
+
+    plt.figure(figsize=(size_w, size_h))
     norm_plot = sns.heatmap(df, annot=True, fmt='.3f', cmap='YlOrRd', vmin=vmin, vmax=vmax)
     norm_plot.set_xticklabels(norm_plot.get_xticklabels(), rotation=0)
-    plt.title('Norms')
-    plt.savefig(os.path.join(folder, name + '_norms.png'))
+    plt.title(r'Norms, $\epsilon = $' + metadata['epsilon'])
+    plt.savefig(os.path.join(folder, metadata['name'] + '_norms.png'))
     plt.clf()
 
 def main():
     data = get_sample_data()
-    create_plots(data)
+    dummy = {'name': 'dummy', 'epsilon': '42'}
+    create_plots(data, dummy)
 
 if __name__ == '__main__':
     main()

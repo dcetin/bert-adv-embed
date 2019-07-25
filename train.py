@@ -21,10 +21,11 @@ import nets
 import data_utils
 from visualize import create_plots
 
-# import pdb; pdb.set_trace()
-import text_datasets
+import utils
 
-def imdb_loader(tempdir, max_vocab_size=None, testing=False, cache=True, sato=True):
+# import pdb; pdb.set_trace()
+
+def imdb_loader(tempdir, max_vocab_size=None, testing=False, cache=True):
     '''
     An ugly custom function for loading the IMDB data.
     '''
@@ -40,29 +41,23 @@ def imdb_loader(tempdir, max_vocab_size=None, testing=False, cache=True, sato=Tr
             unvocab = pickle.load(handle)
 
     else:
-        if sato:
-            sato_vocab_obj, sato_dataset, sato_lm_data, sato_t_vocab = data_utils.load_dataset_imdb(
-                include_pretrain=1, lower=0,
-                min_count=1, ignore_unk=1,
-                use_semi_data=0, add_labeld_to_unlabel=1)
-            (sato_train_x, sato_train_x_len, sato_train_y,
-             sato_dev_x, sato_dev_x_len, sato_dev_y,
-             sato_test_x, sato_test_x_len, sato_test_y) = sato_dataset
-            sato_vocab, sato_vocab_count = sato_vocab_obj
-            sato_semi_train_x, sato_semi_train_x_len = sato_lm_data
-            # print('train_vocab_size:', sato_t_vocab)
-            sato_vocab_inv = dict([(widx, w) for w, widx in sato_vocab.items()])
-            # print('vocab_inv:', len(sato_vocab_inv))
+        vocab_obj, dataset, lm_data, t_vocab = data_utils.load_dataset_imdb(
+            include_pretrain=1, lower=0,
+            min_count=1, ignore_unk=1,
+            use_semi_data=0, add_labeld_to_unlabel=1)
+        (train_x, train_x_len, train_y,
+         dev_x, dev_x_len, dev_y,
+         test_x, test_x_len, test_y) = dataset
+        vocab, vocab_count = vocab_obj
+        semi_train_x, semi_train_x_len = lm_data
+        # print('train_vocab_size:', t_vocab)
+        vocab_inv = dict([(widx, w) for w, widx in vocab.items()])
+        # print('vocab_inv:', len(vocab_inv))
 
-            train = list(zip(sato_train_x, sato_train_y))
-            valid = list(zip(sato_dev_x, sato_dev_y))
-            test = list(zip(sato_test_x, sato_test_y))
-            vocab = sato_vocab
-            unsup = sato_semi_train_x
-
-        else:
-            # (e.g. max_vocab_size=20000 for a small vocab)
-            train, valid, test, unsup, vocab = text_datasets.get_imdb(fine_grained=False, char_based=False, max_vocab_size=None)
+        train = list(zip(train_x, train_y, train_x_len))
+        valid = list(zip(dev_x, dev_y, dev_x_len))
+        test = list(zip(test_x, test_y, test_x_len))
+        unsup = lm_data
 
         unvocab = {}
         for key, value in vocab.items():
@@ -84,7 +79,7 @@ def imdb_loader(tempdir, max_vocab_size=None, testing=False, cache=True, sato=Tr
 
     return train, valid, test, unsup, vocab, unvocab
 
-def adv_FGSM(model, xs, ys, epsilon=5.0, train=False):
+def adv_FGSM(model, xs, ys, xlens=None, epsilon=5.0, train=False):
     '''
     Applies FGSM on embeddings once.
     '''
@@ -93,8 +88,9 @@ def adv_FGSM(model, xs, ys, epsilon=5.0, train=False):
     if train is False:
         model.dropout = 0.0
 
-    lens = [x.shape[0] for x in xs]
-    embed_x = model(xs, return_embed=True)
+    if xlens is None:
+        xlens = [x.shape[0] for x in xs]
+    embed_x = model(xs, xlens=xlens, return_embed=True)
     prediction_test = model(embed_x, feed_embed=True)
     loss_test = F.softmax_cross_entropy(prediction_test, ys, normalize=True)
     model.cleargrads()
@@ -113,7 +109,7 @@ def adv_FGSM(model, xs, ys, epsilon=5.0, train=False):
             grads = [g[0, :l, :] for g, l in zip(grads, lengths)]
             return grads
 
-        adv_p = [epsilon * x for x in sentence_level_norm(adv_g, lens)]
+        adv_p = [epsilon * x for x in sentence_level_norm(adv_g, xlens)]
         # adv_p = [epsilon * F.normalize(x, axis=1) for x in adv_g] # word-level L_2
         # adv_p = [epsilon * F.sign(x) for x in adv_g] # L_infty-norm constraint
 
@@ -132,20 +128,19 @@ def evaluate_fn(eval_iter, device, model, adversarial=False, epsilon=5.0, xp=np)
     eval_losses = []
     eval_accuracies = []
     for eval_batch in eval_iter:
-        eval_batch = eval_iter.next()
-        eval_x, eval_y = map(list, zip(*eval_batch))
+        eval_x, eval_y, eval_x_len = map(list, zip(*eval_batch))
         eval_x = [chainer.dataset.to_device(device, x) for x in eval_x]
         eval_y = chainer.dataset.to_device(device, xp.asarray(eval_y))
 
         if adversarial:
-            adv_eval_x = adv_FGSM(model, eval_x, eval_y, epsilon, train=False)
+            adv_eval_x = adv_FGSM(model, eval_x, eval_y, xlens=eval_x_len, epsilon=epsilon, train=False)
 
         with chainer.using_config('train', False):
             # Forward the eval data
             if adversarial: # Adversarial evaluation
                 prediction_eval = model(adv_eval_x, feed_embed=True)
             else: # Standard evaluation
-                prediction_eval = model(eval_x)
+                prediction_eval = model(eval_x, xlens=eval_x_len)
             # Calculate the loss
             loss_eval = F.softmax_cross_entropy(prediction_eval, eval_y, normalize=True)
             eval_losses.append(to_cpu(loss_eval.array))
@@ -161,7 +156,8 @@ def evaluate_fn(eval_iter, device, model, adversarial=False, epsilon=5.0, xp=np)
 
 def example_nn(model, logger, return_vals=False, xp=np):
     norm_embed = model.get_norm_embed(xp=xp)
-    for word in ['good', 'this', 'that', 'awesome', 'bad', 'wrong']:
+    word_list = ['good', 'this', 'that', 'awesome', 'bad', 'wrong']
+    for word in word_list:
         if return_vals:
             nns, vals = model.get_vec_nn(word, xp=xp, norm_embed=norm_embed, return_vals=True)
             exstr = ' '.join([nn + ' (' + str(val) + ')' for (nn,val) in list(zip(nns.split(' '), vals))])
@@ -178,7 +174,7 @@ def main():
         description='Chainer example: Text Classification')
     # Learning
     parser.add_argument('--batchsize', '-b', type=int, default=32, help='Number of images in each mini-batch.')
-    parser.add_argument('--epoch', '-e', type=int, default=30, help='Number of sweeps over the dataset to train.')
+    parser.add_argument('--epoch', '-e', type=int, default=15, help='Number of sweeps over the dataset to train.')
     parser.add_argument('--grad_clip', type=float, default=5.0, help='Gradient clipping.')
     # Scheduling
     parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate.')
@@ -248,17 +244,17 @@ def main():
     logger.info(args.__dict__)
 
     # Load data
-    train, valid, test, unsup, vocab, unvocab = imdb_loader(args.temp, testing=args.testing, cache=False)
+    train, valid, test, unsup, vocab, unvocab = imdb_loader(args.temp, testing=args.testing)
     n_class = len(set([int(d[1]) for d in train]))
 
     # Log metadata
     if not args.evaluate and args.resume is None:
-        logger.info('Device: {}'.format(device))
-        logger.info('# train data: {}'.format(len(train)))
-        logger.info('# valid data: {}'.format(len(valid)))
-        logger.info('# test  data: {}'.format(len(test)))
-        logger.info('# vocab: {}'.format(len(vocab)))
-        logger.info('# class: {} \n'.format(n_class))
+        # logger.info('Device: {}'.format(device))
+        # logger.info('# train data: {}'.format(len(train)))
+        # logger.info('# valid data: {}'.format(len(valid)))
+        # logger.info('# test  data: {}'.format(len(test)))
+        # logger.info('# vocab: {}'.format(len(vocab)))
+        # logger.info('# class: {} \n'.format(n_class))
         # def dataset_stats(data):
         #     seqlens = [x[0].size -1 for x in data]
         #     print('Num. examples:\t', len(data))
@@ -266,6 +262,7 @@ def main():
         #     print('Max. sequence length:\t', np.max(seqlens))
         #     print('Avg. sequence length:\t', np.average(seqlens))
         # [dataset_stats(x) for x in [train,valid,test,unsup]]
+        pass
 
     # Setup the model and copy the model to the device
     model = nets.classifierModel(n_class, n_layers=args.layers, n_vocab=len(vocab),
@@ -277,12 +274,15 @@ def main():
     model.unvocab = unvocab
     model.logger = logger
 
+    # Log nearest neighbors
+    example_nn(model, logger, xp=xp)
+
     # Load pretrained embedding and weights
     if args.load_pretrained:
         logger.info('Loading pretrained model weights')
         model.load_pretrained(args.pretrained_path)
-	    # Log nearest neighbors
-	    example_nn(model, logger, xp=xp)
+        # Log nearest neighbors
+        example_nn(model, logger, xp=xp)
 
     # Setup an optimizer
     base_alpha = args.learning_rate
@@ -329,27 +329,29 @@ def main():
 
             # Get the training batch
             train_batch = train_iter.next()
-            train_x, train_y = map(list, zip(*train_batch))
+            train_x, train_y, train_x_len = map(list, zip(*train_batch))
             train_x = [chainer.dataset.to_device(device, x) for x in train_x]
             train_y = chainer.dataset.to_device(device, xp.asarray(train_y))
 
             # Calculate the prediction and loss of the network
-            prediction_train = model(train_x)
-            loss = F.softmax_cross_entropy(prediction_train, train_y, normalize=True)
+            prediction_train = model(train_x, xlens=train_x_len)
+            org_loss = F.softmax_cross_entropy(prediction_train, train_y, normalize=True)
             accuracy = F.accuracy(prediction_train, train_y)
             accuracy.to_cpu()
             train_accuracies.append(accuracy.array)
 
             # Adversarial training
-            # if args.adv_train:
-            if args.adv_train and (args.resume > 0 or train_iter.epoch > 1):
-                perturbed = adv_FGSM(model, train_x, train_y, epsilon=args.adv_epsilon, train=True)
-                prediction_train = model(perturbed, feed_embed=True)
-                loss_adv = F.softmax_cross_entropy(prediction_train, train_y, normalize=True)
-                loss = loss + args.adv_lambda * loss_adv
-                accuracy = F.accuracy(prediction_train, train_y)
-                accuracy.to_cpu()
-                train_adv_accuracies.append(accuracy.array)
+            if args.adv_train:
+                if args.load_pretrained or (~args.load_pretrained and (args.resume > 0 or train_iter.epoch > 1)):
+                    perturbed = adv_FGSM(model, train_x, train_y, xlens=train_x_len, epsilon=args.adv_epsilon, train=True)
+                    prediction_train = model(perturbed, feed_embed=True)
+                    adv_loss = F.softmax_cross_entropy(prediction_train, train_y, normalize=True)
+                    loss = org_loss + args.adv_lambda * adv_loss
+                    accuracy = F.accuracy(prediction_train, train_y)
+                    accuracy.to_cpu()
+                    train_adv_accuracies.append(accuracy.array)
+            else:
+                loss = org_loss
 
             # Calculate gradients and update all trainable parameters
             model.cleargrads()
@@ -368,22 +370,22 @@ def main():
 
                 # Display training loss and accuracy
                 logger.info('EPOCH:{:02d} global_step:{:.04f} alpha:{:.08f} '.format(train_iter.epoch + args.resume, global_step, optimizer.hyperparam.alpha))
-                logger.info('train_loss:{:.04f} train_accuracy:{:.04f} '.format(float(to_cpu(loss.array)), np.mean(train_accuracies)))
-                if args.adv_train:
-                    logger.info('train_adv_accuracy:{:.04f} '.format(np.mean(train_adv_accuracies)))
+                logger.info('[train] loss:{:.04f} acc:{:.04f} '.format(float(to_cpu(org_loss.array)), np.mean(train_accuracies)))
                 train_accuracies = []
 
-                # Evaluation on validation data
+                # Standard evaluation
                 valid_loss, valid_acc = evaluate_fn(valid_iter, device, model, xp=xp)
-                logger.info('valid_loss:{:.04f} valid_accuracy:{:.04f}'.format(valid_loss, valid_acc))
-                adv_valid_loss, adv_valid_acc = evaluate_fn(valid_iter, device, model, adversarial=True, epsilon=args.adv_epsilon, xp=xp)
-                logger.info('adv. valid_loss:{:.04f} adv. valid_accuracy:{:.04f}'.format(adv_valid_loss, adv_valid_acc))
+                logger.info('[valid] loss:{:.04f} acc:{:.04f}'.format(valid_loss, valid_acc))
+                test_loss, test_acc = evaluate_fn(test_iter, device, model, xp=xp)
+                logger.info('[test ] loss:{:.04f} acc:{:.04f}'.format(test_loss, test_acc))
 
-                # Evaluation on test data
-                # test_loss, test_acc = evaluate_fn(test_iter, device, model, xp=xp)
-                # logger.info('test_loss:{:.04f} test_accuracy:{:.04f}'.format(test_loss, test_acc))
-                # adv_loss, adv_acc = evaluate_fn(test_iter, device, model, adversarial=True, epsilon=args.adv_epsilon, xp=xp)
-                # logger.info('adv. test_loss:{:.04f} adv. test_accuracy:{:.04f}'.format(adv_loss, adv_acc))
+                # Adversarial evalation
+                if args.adv_train:
+                    logger.info('[train adv] loss:{:.04f} acc:{:.04f} '.format(float(to_cpu(adv_loss.array)), np.mean(train_adv_accuracies)))
+                valid_adv_loss, valid_adv_acc = evaluate_fn(valid_iter, device, model, adversarial=True, epsilon=args.adv_epsilon, xp=xp)
+                logger.info('[valid adv] loss:{:.04f} acc:{:.04f}'.format(valid_adv_loss, valid_adv_acc))
+                # test_adv_loss, test_adv_acc = evaluate_fn(test_iter, device, model, adversarial=True, epsilon=args.adv_epsilon, xp=xp)
+                # logger.info('[test  adv] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
 
                 logger.info('\n')
 
@@ -419,24 +421,29 @@ def main():
 
     # Playground
     def projection_demo(model, eval_iter, logger, xp=np):
-        num_examples = 0
-        max_examples = 3
 
-        for test_batch in eval_iter:
-            test_batch = test_iter.next()
-            test_x, test_y = map(list, zip(*test_batch))
+        # Number of examples to generate
+        max_examples = 5
+        # Maximum sequence length to choose sequences from
+        max_seq_len = 20
+
+        num_examples = 0
+        for bi, test_batch in enumerate(eval_iter):
+            test_x, test_y, test_x_len = map(list, zip(*test_batch))
             test_x = [chainer.dataset.to_device(device, x) for x in test_x]
             test_y = chainer.dataset.to_device(device, xp.asarray(test_y))
 
-            adv_test_x = adv_FGSM(model, test_x, test_y, train=False)
+            adv_test_x = adv_FGSM(model, test_x, test_y, xlens=test_x_len, epsilon=args.adv_epsilon, train=False)
+
+            # logger.debug('bi {} batchsize {} pos {}'.format(bi, len(test_batch), eval_iter.current_position))
 
             with chainer.using_config('train', False):
-                prediction_test = model(test_x, argmax=True)
+                prediction_test = model(test_x, xlens=test_x_len, argmax=True)
                 embed_x = model.embedded
                 embed_x = [x.data for x in embed_x]
                 prediction_adv_test = model(adv_test_x, feed_embed=True, argmax=True)
-                std = (prediction_test == test_y.data)
-                adv = (prediction_adv_test == test_y.data)
+                std = (prediction_test == test_y)
+                adv = (prediction_adv_test == test_y)
                 res = ~adv & std
                 res_ids = xp.where(res.astype(int) == 1)[0].tolist()
 
@@ -451,13 +458,16 @@ def main():
 
                 # Iterate over all adversarial sequences, or pick the shortest one
                 if len(res_ids) > 0:
-                    shortest = min(res_ids, key=lambda x:int(test_x[x].size))
-                    for seq_idx in [shortest]:
+                    # shortest = min(res_ids, key=lambda x:int(test_x[x].size))
+                    # for seq_idx in [shortest]:
+                    for seq_idx in res_ids:
 
                         # Iterate until finding a sufficiently short sequence
-                        if test_x[seq_idx].size > 20:
+                        if test_x[seq_idx].size > max_seq_len:
                             continue
 
+                        num_examples += 1
+                        logger.debug('Visualizing example {}:'.format(num_examples))
                         logger.debug('seq_idx: {} of length {}'.format(seq_idx, test_x[seq_idx].size))
 
                         # Vectorised version
@@ -472,7 +482,14 @@ def main():
                         adv_norm = xp.linalg.norm(adv, axis=1).tolist()
 
                         per = adv-emb
-                        per_nn = model.get_seq_nn(per, norm_embed=norm_embed, xp=xp)
+                        per_nn = []
+                        for wi in range(len(per)):
+                            per_w = per[wi]
+                            org_w = emb[wi]
+                            rel_norm_embed = utils.mat_normalize(model.embed.W.data - org_w, xp=xp)
+                            nn_dir_w = model.get_vec_nn(per_w, k=1, norm_embed=rel_norm_embed, xp=xp)
+                            per_nn.append(nn_dir_w)
+                        per_nn = ' '.join(per_nn)
                         per_norm = xp.linalg.norm(per, axis=1).tolist()
 
                         logger.debug(emb_nn)
@@ -484,26 +501,29 @@ def main():
                         logger.debug('\n')
 
                         data = emb_nn, adv_nn, per_nn, emb_norm, adv_norm, per_norm
-                        name = str(eval_iter.current_position) + '_' + str(seq_idx)
-                        create_plots(data, name, folder=args.out)
-
-                        num_examples += 1
+                        metadata = {}
+                        metadata['name'] = args.out + str(eval_iter.current_position + seq_idx - 32) + '_eps' + str(args.adv_epsilon)
+                        metadata['epsilon'] = str(args.adv_epsilon)
+                        create_plots(data, metadata, folder=args.out)
 
                         if num_examples >= max_examples:
-                            return
-
+                            eval_iter.reset()
+                            return None
         eval_iter.reset()
-    projection_demo(model, test_iter, logger, xp=xp)
+        return None
+    # projection_demo(model, test_iter, logger, xp=xp)
 
-    # Evaluation
+    # Standard evaluation
     valid_loss, valid_acc = evaluate_fn(valid_iter, device, model, xp=xp)
-    logger.info('valid_loss:{:.04f} valid_accuracy:{:.04f}'.format(valid_loss, valid_acc))
-    adv_valid_loss, adv_valid_acc = evaluate_fn(valid_iter, device, model, adversarial=True, epsilon=args.adv_epsilon, xp=xp)
-    logger.info('adv. valid_loss:{:.04f} adv. valid_accuracy:{:.04f}'.format(adv_valid_loss, adv_valid_acc))
+    logger.info('[valid] loss:{:.04f} acc:{:.04f}'.format(valid_loss, valid_acc))
     test_loss, test_acc = evaluate_fn(test_iter, device, model, xp=xp)
-    logger.info('test_loss:{:.04f} test_accuracy:{:.04f}'.format(test_loss, test_acc))
-    adv_loss, adv_acc = evaluate_fn(test_iter, device, model, adversarial=True, epsilon=args.adv_epsilon, xp=xp)
-    logger.info('adv. test_loss:{:.04f} adv. test_accuracy:{:.04f}'.format(adv_loss, adv_acc))
+    logger.info('[test ] loss:{:.04f} acc:{:.04f}'.format(test_loss, test_acc))
+
+    # Adversarial evaluation
+    valid_adv_loss, valid_adv_acc = evaluate_fn(valid_iter, device, model, adversarial=True, epsilon=args.adv_epsilon, xp=xp)
+    logger.info('[valid adv] loss:{:.04f} acc:{:.04f}'.format(valid_adv_loss, valid_adv_acc))
+    test_adv_loss, test_adv_acc = evaluate_fn(test_iter, device, model, adversarial=True, epsilon=args.adv_epsilon, xp=xp)
+    logger.info('[test  adv] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
 
     # Save vocabulary and model's setting
     if not args.evaluate:

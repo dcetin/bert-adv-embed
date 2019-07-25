@@ -4,7 +4,6 @@ Classification and adversarial stuff are based on [Neural Networks for Text Clas
 
 ## Directory
 
-### Current files
 - `do.sh` contains useful commands.
 - `train.py` trains and evaluates the model.
 - `nets.py` implements the RNN model.
@@ -12,12 +11,6 @@ Classification and adversarial stuff are based on [Neural Networks for Text Clas
 - `visualize.py` visualizes adversarial examples.
 - `data_utils.py` implements data loader.
 - `data/imdb/preprocess.py` data preprocessing.
-
-### Legacy
-- `run.py` runs models on online data.
-- `text_datasets.py` legacy data loader.
-- `nlp_utils.py` legacy data preprocessing.
-- `demo.py` is where experimental code is dumped.
 
 ## Prepare data
 

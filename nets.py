@@ -44,7 +44,7 @@ class classifierModel(chainer.Chain):
             w.b5.data[:] = 1.0
 
 
-    def __call__(self, xs, softmax=False, argmax=False, feed_embed=False, return_embed=False):
+    def __call__(self, xs, xlens=None, softmax=False, argmax=False, feed_embed=False, return_embed=False):
         """
         Forward step
         Args:
@@ -59,8 +59,9 @@ class classifierModel(chainer.Chain):
         else:
             # Efficient embedding function for variable-length sequences:
             # equal to [F.dropout(self.embed(x), ratio=self.dropout) for x in xs]
-            x_len = [len(x) for x in xs]
-            x_section = np.cumsum(x_len[:-1])
+            if xlens is None:
+                xlens = [x.shape[0] for x in xs]
+            x_section = np.cumsum(xlens[:-1])
             ex = self.embed(F.concat(xs, axis=0))
             ex = F.dropout(ex, ratio=self.dropout)
             self.embedded = F.split_axis(ex, x_section, 0)
