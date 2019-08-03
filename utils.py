@@ -1,16 +1,19 @@
 import numpy as np
 
 def to_sent(x, unvocab, tokenized=False):
+    '''
+    Converts the given input into a sentence.
+    '''
     if type(x) == tuple:
         return to_sent(x[0], unvocab, tokenized)
+    if type(x) == int:
+        return to_sent([x], unvocab, tokenized)
     if type(x) == list:
         toks = [unvocab[w] for w in x]
         if tokenized:
             return toks
         else:
             return ' '.join(toks)
-    if type(x) == int:
-        return to_sent([x], unvocab, tokenized)
     return to_sent(x.tolist(), unvocab, tokenized)
 
 def vec_normalize(vec, xp=np, epsilon=1e-12):

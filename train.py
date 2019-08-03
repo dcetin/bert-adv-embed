@@ -109,17 +109,16 @@ def adv_FGSM(model, xs, ys, xlens=None, epsilon=5.0, train=False):
             grads = [g[0, :l, :] for g, l in zip(grads, lengths)]
             return grads
 
-        adv_p = [epsilon * x for x in sentence_level_norm(adv_g, xlens)]
+        adv_p = [epsilon * x for x in sentence_level_norm(adv_g, xlens)] # sentence-level L_2
         # adv_p = [epsilon * F.normalize(x, axis=1) for x in adv_g] # word-level L_2
         # adv_p = [epsilon * F.sign(x) for x in adv_g] # L_infty-norm constraint
 
-    perturbed = [x+p for x, p in zip(embed_x, adv_p)]
-    perturbed_data = [x.data for x in perturbed]
+    perturbed = [(x+p).data for x, p in zip(embed_x, adv_p)]
 
     # Restore dropout before returning
     model.dropout = org_dropout
 
-    return perturbed_data
+    return perturbed
 
 def evaluate_fn(eval_iter, device, model, adversarial=False, epsilon=5.0, xp=np):
     '''
@@ -155,6 +154,9 @@ def evaluate_fn(eval_iter, device, model, adversarial=False, epsilon=5.0, xp=np)
     return np.mean(eval_losses), np.mean(eval_accuracies)
 
 def example_nn(model, logger, return_vals=False, xp=np):
+    '''
+    Nearest negihbor examples.
+    '''
     norm_embed = model.get_norm_embed(xp=xp)
     word_list = ['good', 'this', 'that', 'awesome', 'bad', 'wrong']
     for word in word_list:
@@ -164,6 +166,30 @@ def example_nn(model, logger, return_vals=False, xp=np):
             logger.debug(word + ': ' + exstr)
         else:
             logger.debug(word + ': ' + model.get_vec_nn(word, xp=xp, norm_embed=norm_embed))
+    logger.debug('\n')
+
+def analogy(model, logger, pos_words=None, neg_words=None, return_vals=False, xp=np):
+    '''
+    Analogy on word embeddings examples.
+    '''
+    if pos_words is None or neg_words is None:
+        # Expecting queen, happy, go, Italy
+        word_list = [ (['king', 'woman'],['man']), (['sad', 'good'],['bad']), 
+        (['walked', 'went'],['walk']), (['Paris', 'Rome'],['France']) ]
+    else:
+        word_list = [ (pos_words, neg_words) ]
+    for pos_words, neg_words in word_list:
+        pos_embed = [model.embed(xp.array([model.vocab[word]])).data[0] for word in pos_words]
+        neg_embed = [model.embed(xp.array([model.vocab[word]])).data[0] for word in neg_words]
+        pos_embed = xp.sum(xp.stack(pos_embed, axis=0), axis=0)
+        neg_embed = xp.sum(xp.stack(neg_embed, axis=0), axis=0)
+        forw = pos_embed - neg_embed
+        norm_embed = model.get_norm_embed(xp=xp)
+        if return_vals:
+            nns, vals = model.get_vec_nn(forw, xp=xp, norm_embed=norm_embed, return_vals=True)
+            logger.debug(' '.join([nn + ' (' + str(val) + ')' for (nn,val) in list(zip(nns.split(' '), vals))]))
+        else:
+            logger.debug(model.get_vec_nn(forw, xp=xp, norm_embed=norm_embed))
     logger.debug('\n')
 
 def main():
@@ -275,14 +301,16 @@ def main():
     model.logger = logger
 
     # Log nearest neighbors
-    example_nn(model, logger, xp=xp)
+    # example_nn(model, logger, xp=xp)
+    # analogy(model, logger, xp=xp)
 
     # Load pretrained embedding and weights
     if args.load_pretrained:
         logger.info('Loading pretrained model weights')
         model.load_pretrained(args.pretrained_path)
         # Log nearest neighbors
-        example_nn(model, logger, xp=xp)
+        # example_nn(model, logger, xp=xp)
+        # analogy(model, logger, xp=xp)
 
     # Setup an optimizer
     base_alpha = args.learning_rate
@@ -417,13 +445,14 @@ def main():
         chainer.serializers.load_npz(os.path.join(args.out, 'state_epoch_{}.npz'.format(args.eval_epoch)), optimizer)
 
     # Log nearest neighbors
-    example_nn(model, logger, xp=xp)
+    # example_nn(model, logger, xp=xp)
+    # analogy(model, logger, xp=xp)
 
     # Playground
     def projection_demo(model, eval_iter, logger, xp=np):
 
         # Number of examples to generate
-        max_examples = 5
+        max_examples = 1
         # Maximum sequence length to choose sequences from
         max_seq_len = 20
 
@@ -466,9 +495,11 @@ def main():
                         if test_x[seq_idx].size > max_seq_len:
                             continue
 
+                        sequence_offset = eval_iter.current_position + seq_idx - 32
+
                         num_examples += 1
                         logger.debug('Visualizing example {}:'.format(num_examples))
-                        logger.debug('seq_idx: {} of length {}'.format(seq_idx, test_x[seq_idx].size))
+                        logger.debug('seq_offset: {} of length {}'.format(sequence_offset, test_x[seq_idx].size))
 
                         # Vectorised version
                         norm_embed = model.get_norm_embed(xp=xp)
@@ -495,35 +526,62 @@ def main():
                         logger.debug(emb_nn)
                         logger.debug(adv_nn)
                         logger.debug(per_nn)
-                        logger.debug(emb_norm)
-                        logger.debug(adv_norm)
-                        logger.debug(per_norm)
+                        # logger.debug(emb_norm)
+                        # logger.debug(adv_norm)
+                        # logger.debug(per_norm)
                         logger.debug('\n')
+
+
+                        vec_good = model.embed(xp.array([model.vocab['good']])).data[0]
+                        vec_bad = model.embed(xp.array([model.vocab['bad']])).data[0]
+                        norm_good = utils.vec_normalize(vec_good, xp=xp)
+                        norm_bad = utils.vec_normalize(vec_bad, xp=xp)
+
+                        vec_NegativeDir = vec_bad - vec_good
+                        norm_NegativeDir = utils.vec_normalize(vec_NegativeDir, xp=xp)
+
+                        per_normed = utils.mat_normalize(per, xp=xp)
+                        adv_normed = utils.mat_normalize(adv, xp=xp)
+                        emb_normed = utils.mat_normalize(emb, xp=xp)
+                        per_NegativeDir = xp.matmul(per_normed, norm_NegativeDir).tolist()
+                        adv_good = [round(x, 4) for x in xp.matmul(adv_normed, norm_good).tolist()]
+                        adv_bad = [round(x, 4) for x in xp.matmul(adv_normed, norm_bad).tolist()]
+                        emb_good = [round(x, 4) for x in xp.matmul(emb_normed, norm_good).tolist()]
+                        emb_bad = [round(x, 4) for x in xp.matmul(emb_normed, norm_bad).tolist()]
+
+                        print(list(zip(per_nn.split(' '), per_NegativeDir)))
+
+                        print(list(zip(adv_nn.split(' '), adv_good)))
+                        print(list(zip(adv_nn.split(' '), adv_bad)))
+                        print(list(zip(emb_nn.split(' '), emb_good)))
+                        print(list(zip(emb_nn.split(' '), emb_bad)))
+
+
 
                         data = emb_nn, adv_nn, per_nn, emb_norm, adv_norm, per_norm
                         metadata = {}
-                        metadata['name'] = args.out + str(eval_iter.current_position + seq_idx - 32) + '_eps' + str(args.adv_epsilon)
+                        metadata['name'] = args.out + str(sequence_offset) + '_eps' + str(args.adv_epsilon)
                         metadata['epsilon'] = str(args.adv_epsilon)
                         create_plots(data, metadata, folder=args.out)
 
                         if num_examples >= max_examples:
                             eval_iter.reset()
-                            return None
+                            return
+        
         eval_iter.reset()
-        return None
-    # projection_demo(model, test_iter, logger, xp=xp)
+    projection_demo(model, test_iter, logger, xp=xp)
 
     # Standard evaluation
-    valid_loss, valid_acc = evaluate_fn(valid_iter, device, model, xp=xp)
-    logger.info('[valid] loss:{:.04f} acc:{:.04f}'.format(valid_loss, valid_acc))
-    test_loss, test_acc = evaluate_fn(test_iter, device, model, xp=xp)
-    logger.info('[test ] loss:{:.04f} acc:{:.04f}'.format(test_loss, test_acc))
+    # valid_loss, valid_acc = evaluate_fn(valid_iter, device, model, xp=xp)
+    # logger.info('[valid] loss:{:.04f} acc:{:.04f}'.format(valid_loss, valid_acc))
+    # test_loss, test_acc = evaluate_fn(test_iter, device, model, xp=xp)
+    # logger.info('[test ] loss:{:.04f} acc:{:.04f}'.format(test_loss, test_acc))
 
-    # Adversarial evaluation
-    valid_adv_loss, valid_adv_acc = evaluate_fn(valid_iter, device, model, adversarial=True, epsilon=args.adv_epsilon, xp=xp)
-    logger.info('[valid adv] loss:{:.04f} acc:{:.04f}'.format(valid_adv_loss, valid_adv_acc))
-    test_adv_loss, test_adv_acc = evaluate_fn(test_iter, device, model, adversarial=True, epsilon=args.adv_epsilon, xp=xp)
-    logger.info('[test  adv] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
+    # # Adversarial evaluation
+    # valid_adv_loss, valid_adv_acc = evaluate_fn(valid_iter, device, model, adversarial=True, epsilon=args.adv_epsilon, xp=xp)
+    # logger.info('[valid adv] loss:{:.04f} acc:{:.04f}'.format(valid_adv_loss, valid_adv_acc))
+    # test_adv_loss, test_adv_acc = evaluate_fn(test_iter, device, model, adversarial=True, epsilon=args.adv_epsilon, xp=xp)
+    # logger.info('[test  adv] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
 
     # Save vocabulary and model's setting
     if not args.evaluate:
