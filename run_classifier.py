@@ -38,6 +38,7 @@ import numpy as np
 
 _logger = logging.getLogger(__name__)
 
+import sys
 
 def get_arguments():
     parser = argparse.ArgumentParser(description='Arxiv')
@@ -104,6 +105,11 @@ def get_arguments():
     parser.add_argument(
         '--do_print_test', type=strtobool, default='False',
         help="Whether to print some outputs on the partial dev set.")
+
+    # drk
+    parser.add_argument(
+        '--do_resume', type=strtobool, default='False',
+        help="Whether to resume training from a checkpoint.")
 
     # These args are NOT used in this port.
     parser.add_argument('--use_tpu', type=strtobool, default='False')
@@ -272,6 +278,37 @@ class ColaProcessor(DataProcessor):
         return examples
 
 
+class ImdbProcessor(DataProcessor):
+  """Processor for the IMDB data set (custom)."""
+
+  def get_train_examples(self, data_dir):
+    """Gets a collection of `InputExample`s for the train set."""
+    return self._create_examples(
+        self._read_tsv(os.path.join(data_dir, "train.tsv"), quotechar='"'), "train")
+
+  def get_test_examples(self, data_dir):
+    """Gets a collection of `InputExample`s for the test set."""
+    return self._create_examples(
+        self._read_tsv(os.path.join(data_dir, "test.tsv"), quotechar='"'), "test")
+
+  def get_labels(self):
+    """See base class."""
+    return ["0", "1"]
+
+  def _create_examples(self, lines, set_type):
+    """Creates examples for the training and test sets."""
+    examples = []
+    for (i, line) in enumerate(lines):
+      if i == 0:
+        continue
+      guid = "%s-%s" % (set_type, i)
+      text_a = tokenization.convert_to_unicode(line[1])
+      label = tokenization.convert_to_unicode(line[0])
+      examples.append(
+          InputExample(guid=guid, text_a=text_a, text_b=None, label=label))
+    return examples
+
+
 class Converter(object):
     """Converts examples to features, and then batches and to_gpu."""
 
@@ -423,6 +460,7 @@ def main():
         "cola": ColaProcessor,
         "mnli": MnliProcessor,
         "mrpc": MrpcProcessor,
+        "imdb": ImdbProcessor,
     }
 
     if not FLAGS.do_train and not FLAGS.do_eval and not FLAGS.do_print_test:
@@ -456,6 +494,8 @@ def main():
     num_train_steps = None
     num_warmup_steps = None
 
+    print('before preproc')
+    sys.stdout.flush()
     # TODO: use special Adam from "optimization.py"
     if FLAGS.do_train:
         train_examples = processor.get_train_examples(FLAGS.data_dir)
@@ -463,11 +503,19 @@ def main():
             len(train_examples) / FLAGS.train_batch_size * FLAGS.num_train_epochs)
         num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
 
+    print('before model')
+    sys.stdout.flush()
     bert = modeling.BertModel(config=bert_config)
     model = modeling.BertClassifier(bert, num_labels=len(label_list))
     chainer.serializers.load_npz(
         FLAGS.init_checkpoint, model,
         ignore_names=['output/W', 'output/b'])
+
+    if FLAGS.do_resume:
+        chainer.serializers.load_npz('./base_out_imdb/model_snapshot_iter_781.npz', model)
+
+    print('after checkpoint')
+    sys.stdout.flush()
 
     if FLAGS.gpu >= 0:
         chainer.backends.cuda.get_device_from_id(FLAGS.gpu).use()
@@ -516,7 +564,7 @@ def main():
         trainer.run()
 
     if FLAGS.do_eval:
-        eval_examples = processor.get_dev_examples(FLAGS.data_dir)
+        eval_examples = processor.get_test_examples(FLAGS.data_dir)
         test_iter = chainer.iterators.SerialIterator(
             eval_examples, FLAGS.train_batch_size * 2,
             repeat=False, shuffle=False)
@@ -530,7 +578,7 @@ def main():
 
     # if you wanna see some output arrays for debugging
     if FLAGS.do_print_test:
-        short_eval_examples = processor.get_dev_examples(FLAGS.data_dir)[:3]
+        short_eval_examples = processor.get_test_examples(FLAGS.data_dir)[:3]
         short_eval_examples = short_eval_examples[:FLAGS.eval_batch_size]
         short_test_iter = chainer.iterators.SerialIterator(
             short_eval_examples, FLAGS.eval_batch_size,
