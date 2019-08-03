@@ -511,7 +511,7 @@ def main():
         trainer.extend(extensions.PrintReport(
             ['iteration', 'main/loss',
              'main/accuracy', 'elapsed_time']))
-        trainer.extend(extensions.ProgressBar(update_interval=10))
+        # trainer.extend(extensions.ProgressBar(update_interval=10))
 
         trainer.run()
 
@@ -525,6 +525,7 @@ def main():
         evaluator = extensions.Evaluator(
             test_iter, model, converter=converter, device=FLAGS.gpu)
         results = evaluator()
+        print('Evaluation:')
         print(results)
 
     # if you wanna see some output arrays for debugging
