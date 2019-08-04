@@ -38,7 +38,8 @@ import numpy as np
 
 _logger = logging.getLogger(__name__)
 
-import sys
+import utils
+from chainer.backends.cuda import to_cpu
 
 def get_arguments():
     parser = argparse.ArgumentParser(description='Arxiv')
@@ -101,15 +102,14 @@ def get_arguments():
     parser.add_argument(
         '--iterations_per_loop', type=int, default=1000,
         help="How many steps to make in each estimator call.")
-    # add
-    parser.add_argument(
-        '--do_print_test', type=strtobool, default='False',
-        help="Whether to print some outputs on the partial dev set.")
 
     # drk
     parser.add_argument(
         '--do_resume', type=strtobool, default='False',
         help="Whether to resume training from a checkpoint.")
+    parser.add_argument(
+        '--do_experiment', type=strtobool, default='False',
+        help="Whether to experiment before exiting.")
 
     # These args are NOT used in this port.
     parser.add_argument('--use_tpu', type=strtobool, default='False')
@@ -455,6 +455,28 @@ def _truncate_seq_pair(tokens_a, tokens_b, max_length):
             tokens_b.pop()
 
 
+def evaluate_fn(eval_iter, device, model, converter, adversarial=False, epsilon=5.0):
+    eval_losses = []
+    eval_accuracies = []
+    for test_batch in eval_iter:
+        input_ids, input_mask, segment_ids, label_id = converter(test_batch, FLAGS.gpu)
+        with chainer.using_config('train', False):
+            with chainer.no_backprop_mode():
+                if adversarial:
+                    pass
+                else:
+                    pred_logits = model(input_ids, input_mask, segment_ids, label_id, return_logits=True)
+                # Calculate the loss
+                loss_eval = F.softmax_cross_entropy(pred_logits, label_id, normalize=True)
+                eval_losses.append(to_cpu(loss_eval.array))
+                # Calculate the accuracy
+                accuracy = F.accuracy(pred_logits, label_id)
+                accuracy.to_cpu()
+                eval_accuracies.append(accuracy.array)
+    eval_iter.reset()
+    return np.mean(eval_losses), np.mean(eval_accuracies)
+
+
 def main():
     processors = {
         "cola": ColaProcessor,
@@ -463,9 +485,9 @@ def main():
         "imdb": ImdbProcessor,
     }
 
-    if not FLAGS.do_train and not FLAGS.do_eval and not FLAGS.do_print_test:
+    if not FLAGS.do_train and not FLAGS.do_eval and not FLAGS.do_experiment:
         raise ValueError("At least one of `do_train` or `do_eval` "
-                         "or `do_print_test` must be True.")
+                         "or `do_experiment` must be True.")
 
     bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
 
@@ -494,8 +516,6 @@ def main():
     num_train_steps = None
     num_warmup_steps = None
 
-    print('before preproc')
-    sys.stdout.flush()
     # TODO: use special Adam from "optimization.py"
     if FLAGS.do_train:
         train_examples = processor.get_train_examples(FLAGS.data_dir)
@@ -503,19 +523,16 @@ def main():
             len(train_examples) / FLAGS.train_batch_size * FLAGS.num_train_epochs)
         num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
 
-    print('before model')
-    sys.stdout.flush()
     bert = modeling.BertModel(config=bert_config)
     model = modeling.BertClassifier(bert, num_labels=len(label_list))
     chainer.serializers.load_npz(
         FLAGS.init_checkpoint, model,
         ignore_names=['output/W', 'output/b'])
 
+    converter = Converter(label_list, FLAGS.max_seq_length, tokenizer)
+
     if FLAGS.do_resume:
         chainer.serializers.load_npz('./base_out_imdb/model_snapshot_iter_781.npz', model)
-
-    print('after checkpoint')
-    sys.stdout.flush()
 
     if FLAGS.gpu >= 0:
         chainer.backends.cuda.get_device_from_id(FLAGS.gpu).use()
@@ -531,8 +548,6 @@ def main():
 
         train_iter = chainer.iterators.SerialIterator(
             train_examples, FLAGS.train_batch_size)
-        converter = Converter(
-            label_list, FLAGS.max_seq_length, tokenizer)
         updater = training.updaters.StandardUpdater(
             train_iter, optimizer,
             converter=converter,
@@ -559,43 +574,39 @@ def main():
         trainer.extend(extensions.PrintReport(
             ['iteration', 'main/loss',
              'main/accuracy', 'elapsed_time']))
-        # trainer.extend(extensions.ProgressBar(update_interval=10))
+        # trainer.extend(extensions.ProgressBar(update_interval=10))        
 
         trainer.run()
 
     if FLAGS.do_eval:
         eval_examples = processor.get_test_examples(FLAGS.data_dir)
-        test_iter = chainer.iterators.SerialIterator(
-            eval_examples, FLAGS.train_batch_size * 2,
-            repeat=False, shuffle=False)
-        converter = Converter(
-            label_list, FLAGS.max_seq_length, tokenizer)
-        evaluator = extensions.Evaluator(
-            test_iter, model, converter=converter, device=FLAGS.gpu)
-        results = evaluator()
-        print('Evaluation:')
-        print(results)
+        test_iter = chainer.iterators.SerialIterator(eval_examples, FLAGS.train_batch_size * 2, repeat=False, shuffle=False)
+
+        test_loss, test_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter)
+        print('[test ] loss:{:.04f} acc:{:.04f}'.format(test_loss, test_acc))
 
     # if you wanna see some output arrays for debugging
-    if FLAGS.do_print_test:
-        short_eval_examples = processor.get_test_examples(FLAGS.data_dir)[:3]
-        short_eval_examples = short_eval_examples[:FLAGS.eval_batch_size]
-        short_test_iter = chainer.iterators.SerialIterator(
-            short_eval_examples, FLAGS.eval_batch_size,
-            repeat=False, shuffle=False)
-        converter = Converter(
-            label_list, FLAGS.max_seq_length, tokenizer)
-        evaluator = extensions.Evaluator(
-            test_iter, model, converter=converter, device=FLAGS.gpu)
+    if FLAGS.do_experiment:
+
+        unvocab = {}
+        for key, value in tokenizer.vocab.items():
+            unvocab[value] = key
 
         with chainer.using_config('train', False):
             with chainer.no_backprop_mode():
-                data = short_test_iter.__next__()
-                out = model.bert.get_pooled_output(
-                    *converter(data, FLAGS.gpu)[:-1])
-                print(out)
-                print(out.shape)
-            print(converter(data, -1))
+                data = test_iter.__next__()
+                input_ids, input_mask, segment_ids, label_id = converter(data, FLAGS.gpu)
+                # pooled_out = model.bert.get_pooled_output(input_ids, input_mask, segment_ids)
+                word_embeddings = model.bert.get_word_embeddings(input_ids, input_mask, segment_ids)
+                embedding_out = model.bert.get_embedding_output(input_ids, input_mask, segment_ids)
+                # logits = model(input_ids, input_mask, segment_ids, label_id, return_logits=True)
+                # probas = F.softmax(logits)
+                embed_mat = model.bert.word_embeddings.W.data
+                xp = model.bert.xp
+                norm_embed = utils.mat_normalize(embed_mat, xp=xp)
+                ex_sent = utils.to_sent(input_ids[0], unvocab)
+                nns = utils.to_sent(utils.nn_vec(embed_mat, embed_mat[tokenizer.vocab['bad']], k=20, xp=xp), unvocab)
+                # import pdb; pdb.set_trace()
 
 
 if __name__ == "__main__":

@@ -175,13 +175,15 @@ class BertClassifier(chainer.Chain):
                 None, num_labels,
                 initialW=create_initializer(initializer_range=0.02))
 
-    def __call__(self, input_ids, input_mask, token_type_ids, labels):
+    def __call__(self, input_ids, input_mask, token_type_ids, labels, return_logits=False):
         output_layer = self.bert.get_pooled_output(
             input_ids,
             input_mask,
             token_type_ids)
         output_layer = F.dropout(output_layer, 0.1)
         logits = self.output(output_layer)
+        if return_logits:
+            return logits
         loss = F.softmax_cross_entropy(logits, labels)
         chainer.report({'loss': loss.array}, self)
         chainer.report({'accuracy': F.accuracy(logits, labels)}, self)
@@ -329,7 +331,8 @@ class BertModel(chainer.Chain):
                  token_type_ids=None,
                  get_embedding_output=False,
                  get_all_encoder_layers=False,
-                 get_sequence_output=False):
+                 get_sequence_output=False,
+                 get_word_embeddings=False):
         """Encode by BertModel.
 
         Args:
@@ -355,6 +358,8 @@ class BertModel(chainer.Chain):
 
         # Embed (sub-)words
         embedding_output = self.word_embeddings(input_ids)
+        if get_word_embeddings:
+            return embedding_output
 
         # Add positional embeddings and token type embeddings, then layer
         # normalize and perform dropout.
@@ -411,6 +416,10 @@ class BertModel(chainer.Chain):
     def get_embedding_output(self, input_ids, input_mask=None, token_type_ids=None):
         return self.__call__(input_ids, input_mask, token_type_ids,
                              get_embedding_output=True)
+
+    def get_word_embeddings(self, input_ids, input_mask=None, token_type_ids=None):
+        return self.__call__(input_ids, input_mask, token_type_ids,
+                             get_word_embeddings=True)
 
     def get_all_encoder_layers(self, input_ids, input_mask=None, token_type_ids=None):
         return self.__call__(input_ids, input_mask, token_type_ids,
