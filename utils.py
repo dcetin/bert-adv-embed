@@ -47,3 +47,20 @@ def nn_vec(mat, vec, k=1, normalize=True, return_vals=False, xp=np):
         return nns, cosines[nns]
     else:
         return nns
+
+def nn_vec_L2(mat, vec, k=1, return_vals=False, xp=np):
+    '''
+    Computes nearest neighbors (in terms of cosine similarity) 
+    of the given vector in columns of the given matrix.
+    '''
+    norms = xp.linalg.norm(mat - vec, axis=1)
+
+    if k==1:    # Return the most similar element
+        nns = xp.argmin(norms)
+    else:       # Calculate nearest neighbors
+        nns = xp.argsort(norms)[:k]
+    
+    if return_vals:
+        return nns, norms[nns]
+    else:
+        return nns

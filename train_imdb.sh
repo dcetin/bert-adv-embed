@@ -17,8 +17,8 @@ python run_classifier.py \
   --max_seq_length=128 \
   --train_batch_size=32 \
   --learning_rate=2e-5 \
-  --num_train_epochs=1 \
-  --output_dir=./out_imdb \
+  --num_train_epochs=3 \
+  --output_dir=./out3_imdb \
   $@
 
   # --max_seq_length=128 \

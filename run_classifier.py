@@ -40,6 +40,8 @@ _logger = logging.getLogger(__name__)
 
 import utils
 from chainer.backends.cuda import to_cpu
+import sys
+from visualize import create_plots
 
 def get_arguments():
     parser = argparse.ArgumentParser(description='Arxiv')
@@ -110,6 +112,9 @@ def get_arguments():
     parser.add_argument(
         '--do_experiment', type=strtobool, default='False',
         help="Whether to experiment before exiting.")
+    parser.add_argument(
+        '--adv_epsilon', type=float, default=0.5,
+        help="Adversarial perturbation coefficient.")
 
     # These args are NOT used in this port.
     parser.add_argument('--use_tpu', type=strtobool, default='False')
@@ -455,17 +460,120 @@ def _truncate_seq_pair(tokens_a, tokens_b, max_length):
             tokens_b.pop()
 
 
-def evaluate_fn(eval_iter, device, model, converter, adversarial=False, epsilon=5.0):
+# New functions
+
+def adv_FGSM(model, data, epsilon=0.5, train=False):
+
+    # Cannot seem to backprop on eval mode, so this seems like a possible workaround
+    org_dropout = (model.output_dropout, 
+        model.bert.dropout_prob, 
+        model.bert.encoder.hidden_dropout_prob, 
+        model.bert.encoder.attention_probs_dropout_prob)
+    if train is False:
+        model.output_dropout = 0.0
+        model.bert.dropout_prob = 0.0
+        model.bert.encoder.hidden_dropout_prob = 0.0
+        model.bert.encoder.attention_probs_dropout_prob = 0.0
+
+    input_ids, input_mask, segment_ids, label_id = data
+    word_embed_lookup = model.bert.get_word_embeddings(input_ids, input_mask, segment_ids) # var: (64, 128, 768)
+    pooled_out = model.bert(input_ids, input_mask, segment_ids, 
+        feed_word_embeddings=True, input_word_embeddings=word_embed_lookup)
+    pred_logits = model.get_logits_from_output(pooled_out)
+    loss_eval = F.softmax_cross_entropy(pred_logits, label_id, normalize=True)
+    model.cleargrads()
+    adv_g = chainer.grad([loss_eval], [model.bert.word_embed_lookup])[0] # var: (64, 128, 768)
+
+    with chainer.using_config('train', False):
+        def sentence_level_norm(grads):
+            batchsize, embed_dim, maxlen = grads.shape
+            grads = F.reshape(grads, (batchsize, embed_dim * maxlen))
+            grads = F.normalize(grads, axis=1)
+            grads = F.reshape(grads, (batchsize, embed_dim, maxlen))
+            return grads
+
+        adv_p = epsilon * sentence_level_norm(adv_g) # sentence-level L_2
+        perturbed = word_embed_lookup + adv_p
+
+    # Restore dropout before returning
+    (model.output_dropout, 
+        model.bert.dropout_prob, 
+        model.bert.encoder.hidden_dropout_prob, 
+        model.bert.encoder.attention_probs_dropout_prob) = org_dropout
+
+    return perturbed
+
+def adv_FGSM_k(model, data, epsilon=0.5, k=3, train=False):
+
+    # Cannot seem to backprop on eval mode, so this seems like a possible workaround
+    org_dropout = (model.output_dropout, 
+        model.bert.dropout_prob, 
+        model.bert.encoder.hidden_dropout_prob, 
+        model.bert.encoder.attention_probs_dropout_prob)
+    if train is False:
+        model.output_dropout = 0.0
+        model.bert.dropout_prob = 0.0
+        model.bert.encoder.hidden_dropout_prob = 0.0
+        model.bert.encoder.attention_probs_dropout_prob = 0.0
+
+    input_ids, input_mask, segment_ids, label_id = data
+    word_embed_lookup = model.bert.get_word_embeddings(input_ids, input_mask, segment_ids) # var: (64, 128, 768)
+
+
+    for i in range(k):
+        pooled_out = model.bert(input_ids, input_mask, segment_ids, 
+            feed_word_embeddings=True, input_word_embeddings=word_embed_lookup)
+        pred_logits = model.get_logits_from_output(pooled_out)
+        loss_eval = F.softmax_cross_entropy(pred_logits, label_id, normalize=True)
+        model.cleargrads()
+        adv_g = chainer.grad([loss_eval], [model.bert.word_embed_lookup])[0] # var: (64, 128, 768)
+
+        with chainer.using_config('train', False):
+            def sentence_level_norm(grads):
+                batchsize, embed_dim, maxlen = grads.shape
+                grads = F.reshape(grads, (batchsize, embed_dim * maxlen))
+                grads = F.normalize(grads, axis=1)
+                grads = F.reshape(grads, (batchsize, embed_dim, maxlen))
+                return grads
+
+            adv_p = epsilon * sentence_level_norm(adv_g) # sentence-level L_2
+            word_embed_lookup = word_embed_lookup + adv_p
+
+
+    # Restore dropout before returning
+    (model.output_dropout, 
+        model.bert.dropout_prob, 
+        model.bert.encoder.hidden_dropout_prob, 
+        model.bert.encoder.attention_probs_dropout_prob) = org_dropout
+
+    return word_embed_lookup
+
+def evaluate_fn(eval_iter, device, model, converter, adversarial=False, k=1, epsilon=0.5):
     eval_losses = []
     eval_accuracies = []
     for test_batch in eval_iter:
-        input_ids, input_mask, segment_ids, label_id = converter(test_batch, FLAGS.gpu)
+
+        data = converter(test_batch, device)
+        input_ids, input_mask, segment_ids, label_id = data
+
+        if adversarial:
+            if k == 1:
+                adv_word_embed_lookup = adv_FGSM(model, data, epsilon=epsilon, train=False)
+            else:
+                adv_word_embed_lookup = adv_FGSM_k(model, data, epsilon=epsilon, k=k, train=False)
+
         with chainer.using_config('train', False):
             with chainer.no_backprop_mode():
+
                 if adversarial:
-                    pass
+                    # Adversarial evaluation: manual feed the embeds to bert
+                    pooled_out = model.bert(input_ids, input_mask, segment_ids, 
+                        feed_word_embeddings=True, input_word_embeddings=adv_word_embed_lookup)
+                    pred_logits = model.get_logits_from_output(pooled_out)
                 else:
+                    # Standard evaluation: the whole pipeline
                     pred_logits = model(input_ids, input_mask, segment_ids, label_id, return_logits=True)
+
                 # Calculate the loss
                 loss_eval = F.softmax_cross_entropy(pred_logits, label_id, normalize=True)
                 eval_losses.append(to_cpu(loss_eval.array))
@@ -474,7 +582,85 @@ def evaluate_fn(eval_iter, device, model, converter, adversarial=False, epsilon=
                 accuracy.to_cpu()
                 eval_accuracies.append(accuracy.array)
     eval_iter.reset()
+
     return np.mean(eval_losses), np.mean(eval_accuracies)
+
+def get_seq_nn(model, seq, unvocab, norm_embed=None, project=False, xp=np):
+    if norm_embed is None:
+        embed_mat = model.bert.word_embeddings.W.data
+        norm_embed = utils.mat_normalize(embed_mat, xp=xp)
+    seq_norm = utils.mat_normalize(seq, xp=xp)
+    seq_nn = xp.matmul(norm_embed, seq_norm.T)
+    seq_nn = xp.argmax(seq_nn, axis=0)
+
+    if project:
+        units = norm_embed[seq_nn]
+        return xp.multiply(units, seq)
+    else:
+        return utils.to_sent(seq_nn, unvocab)
+
+def get_vec_nn(model, inp, unvocab, vocab, k=10, return_vals=False, norm_embed=None, xp=np):
+    embed_mat = model.bert.word_embeddings.W.data
+    if norm_embed is None:
+        norm_embed = utils.mat_normalize(embed_mat, xp=xp)
+
+    if type(inp) == str:            # input is a word
+        norm_forw = utils.vec_normalize(embed_mat[vocab[inp]], xp=xp)
+    elif type(inp) == int:          # input is a vocabulary index
+        norm_forw = utils.vec_normalize(embed_mat[inp], xp=xp)
+    elif type(inp) == xp.ndarray:   # input is an embedding vector
+        norm_forw = utils.vec_normalize(inp, xp=xp)
+    else:
+        logger.error('Unsupported input format for nearest neighbors.')
+    
+    max_idx = utils.nn_vec(norm_embed, norm_forw, k=k, normalize=False, xp=xp, return_vals=return_vals)
+    if return_vals:
+        words = utils.to_sent(max_idx[0], unvocab)
+        return words, [round(x, 5) for x in max_idx[1].tolist()]
+    else:
+        words = utils.to_sent(max_idx, unvocab)
+        return words
+
+def analogy(model, unvocab, vocab, pos_words=None, neg_words=None, return_vals=False, xp=np):
+    '''
+    Analogy on word embeddings examples.
+    '''
+    embed_mat = model.bert.word_embeddings.W.data
+    norm_embed = utils.mat_normalize(embed_mat, xp=xp)
+    if pos_words is None or neg_words is None:
+        # Expecting queen, happy, go, italy
+        word_list = [ (['king', 'woman'],['man']), (['sad', 'good'],['bad']), 
+        (['walked', 'went'],['walk']), (['paris', 'rome'],['france']) ]
+    else:
+        word_list = [ (pos_words, neg_words) ]
+    for pos_words, neg_words in word_list:
+        pos_embed = [embed_mat[vocab[word]] for word in pos_words]
+        neg_embed = [embed_mat[vocab[word]] for word in neg_words]
+        pos_embed = xp.sum(xp.stack(pos_embed, axis=0), axis=0)
+        neg_embed = xp.sum(xp.stack(neg_embed, axis=0), axis=0)
+        forw = pos_embed - neg_embed
+        if return_vals:
+            nns, vals = get_vec_nn(model, forw, unvocab, vocab, xp=xp, norm_embed=norm_embed, return_vals=True)
+            print(' '.join([nn + ' (' + str(val) + ')' for (nn,val) in list(zip(nns.split(' '), vals))]))
+        else:
+            print(get_vec_nn(model, forw, unvocab, vocab, xp=xp, norm_embed=norm_embed))
+    print('\n')
+
+def example_nn(model, unvocab, vocab, return_vals=False, xp=np):
+        '''
+        Nearest negihbor examples.
+        '''
+        embed_mat = model.bert.word_embeddings.W.data
+        norm_embed = utils.mat_normalize(embed_mat, xp=xp)
+        word_list = ['good', 'this', 'that', 'awesome', 'bad', 'wrong']
+        for word in word_list:
+            if return_vals:
+                nns, vals = get_vec_nn(model, word, unvocab, vocab, xp=xp, norm_embed=norm_embed, return_vals=True)
+                exstr = ' '.join([nn + ' (' + str(val) + ')' for (nn,val) in list(zip(nns.split(' '), vals))])
+                print(word + ': ' + exstr)
+            else:
+                print(word + ': ' + get_vec_nn(model, word, unvocab, vocab, xp=xp, norm_embed=norm_embed))
+        print('\n')
 
 
 def main():
@@ -532,7 +718,8 @@ def main():
     converter = Converter(label_list, FLAGS.max_seq_length, tokenizer)
 
     if FLAGS.do_resume:
-        chainer.serializers.load_npz('./base_out_imdb/model_snapshot_iter_781.npz', model)
+        # chainer.serializers.load_npz('./base_out_imdb/model_snapshot_iter_781.npz', model)
+        chainer.serializers.load_npz('./base_out3_imdb/model_snapshot_iter_2343.npz', model)        
 
     if FLAGS.gpu >= 0:
         chainer.backends.cuda.get_device_from_id(FLAGS.gpu).use()
@@ -584,25 +771,217 @@ def main():
 
         test_loss, test_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter)
         print('[test ] loss:{:.04f} acc:{:.04f}'.format(test_loss, test_acc))
+        test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, epsilon=FLAGS.adv_epsilon, adversarial=True)
+        print('[test  adv] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
+        # test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, k=3, epsilon=(FLAGS.adv_epsilon/3), adversarial=True)
+        # print('[test adv3] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
 
     # if you wanna see some output arrays for debugging
     if FLAGS.do_experiment:
 
+        eval_examples = processor.get_test_examples(FLAGS.data_dir)
+        test_iter = chainer.iterators.SerialIterator(eval_examples, FLAGS.train_batch_size * 2, repeat=False, shuffle=False)
+        xp = model.bert.xp
         unvocab = {}
         for key, value in tokenizer.vocab.items():
             unvocab[value] = key
+
+        print('Some example nearest neighbors:')
+        example_nn(model, unvocab, tokenizer.vocab, return_vals=True, xp=xp)
+        print('Some example analogies:')
+        print("Given 'king + woman - man', 'sad + good - bad', 'walked + went - walk', 'paris + rome - france', expecting queen, happy, go, italy")
+        analogy(model, unvocab, tokenizer.vocab, pos_words=None, neg_words=None, return_vals=True, xp=xp)
+
+        def projection_demo(model, eval_iter, converter, epsilon, adv_k=1, xp=np):
+
+            # Number of examples to generate
+            max_examples = 1
+            # Maximum sequence length to choose sequences from
+            max_seq_len = 90
+
+            num_examples = 0
+            for bi, test_batch in enumerate(eval_iter):
+
+                data = converter(test_batch, FLAGS.gpu)
+                input_ids, input_mask, segment_ids, label_id = data
+
+                if adv_k == 1:
+                    adv_test_x = adv_FGSM(model, data, epsilon=epsilon, train=False)
+                else:
+                    adv_test_x = adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False)
+
+                # print('bi {} batchsize {} pos {}'.format(bi, len(test_batch), eval_iter.current_position))
+
+                # Sparsification here on the masked input?
+
+                with chainer.using_config('train', False):
+
+                    embed_x = model.bert.get_word_embeddings(input_ids, input_mask, segment_ids)
+
+                    # Prediction on original data
+                    pred_logits = model(input_ids, input_mask, segment_ids, label_id, return_logits=True)
+                    prediction_test = xp.argmax(pred_logits.data, axis=1)
+
+                    # Prediction on adversarial data
+                    pooled_out = model.bert(input_ids, input_mask, segment_ids, 
+                        feed_word_embeddings=True, input_word_embeddings=adv_test_x)
+                    pred_logits = model.get_logits_from_output(pooled_out)
+                    prediction_adv_test = xp.argmax(pred_logits.data, axis=1)
+
+                    std = (prediction_test == label_id)
+                    adv = (prediction_adv_test == label_id)
+                    res = ~adv & std
+                    res_ids = xp.where(res.astype(int) == 1)[0].tolist()
+
+                    adv_test_x = adv_test_x.data
+                    embed_x = embed_x.data
+
+                    # print('groundtruth: {}'.format(label_id))
+                    # print('predictions: {}'.format(prediction_test))
+                    # print('adv.  preds: {}'.format(prediction_adv_test))
+                    # print('std: {}'.format(std.astype(int)))
+                    # print('adv: {}'.format(adv.astype(int)))
+                    # print('res: {}'.format(res.astype(int)))
+                    # print('std acc: {}'.format(std.mean()))
+                    # print('adv acc: {}'.format(adv.mean()))
+
+                    # Iterate over all adversarial sequences, or pick the shortest one
+                    if len(res_ids) > 0:
+                        # shortest = min(res_ids, key=lambda x:int(input_ids[x].size))
+                        # for seq_idx in [shortest]:
+                        for seq_idx in res_ids:
+
+                            seqlen = int(sum(input_mask[seq_idx].tolist()))
+
+                            # Iterate until finding a sufficiently short sequence
+                            if max_seq_len is not None and seqlen > max_seq_len:
+                                continue
+
+                            sequence_offset = eval_iter.current_position + seq_idx - (FLAGS.train_batch_size * 2)
+
+                            num_examples += 1
+                            print('Visualizing example {}:'.format(num_examples))
+                            print('seq_offset: {} of length {}'.format(sequence_offset, seqlen))
+
+                            # Vectorised version
+                            embed_mat = model.bert.word_embeddings.W.data
+                            norm_embed = utils.mat_normalize(embed_mat, xp=xp)
+
+                            emb = embed_x[seq_idx]
+                            adv = adv_test_x[seq_idx]
+                            inp = input_ids[seq_idx]
+
+                            emb = emb[:seqlen]
+                            adv = adv[:seqlen]
+                            inp = input_ids[:seqlen]
+
+                            emb_cos_nn = get_seq_nn(model, emb, unvocab, norm_embed=norm_embed, xp=xp)
+                            emb_l2_norm = xp.linalg.norm(emb, axis=1).tolist()
+
+                            adv_cos_nn = get_seq_nn(model, adv, unvocab, norm_embed=norm_embed, xp=xp)
+                            adv_l2_norm = xp.linalg.norm(adv, axis=1).tolist()
+
+                            per = adv-emb
+                            per_cos_nn = []
+                            # per_l2_nn = []
+                            for wi in range(len(per)):
+                                per_w = per[wi]
+                                org_w = emb[wi]
+                                rel_norm_embed = utils.mat_normalize(embed_mat - org_w, xp=xp)
+                                nn_dir_w = get_vec_nn(model, per_w, unvocab, tokenizer.vocab, k=1, norm_embed=rel_norm_embed, xp=xp)
+                                per_cos_nn.append(nn_dir_w)
+                                # per_l2_nn.append(utils.to_sent(utils.nn_vec_L2(embed_mat - org_w, per_w, k=1, return_vals=False, xp=xp), unvocab))
+                            per_cos_nn = ' '.join(per_cos_nn)
+                            # per_l2_nn = ' '.join(per_l2_nn)
+                            per_l2_norm = xp.linalg.norm(per, axis=1).tolist()
+
+                            print('L2 nearest neighbors of the original input:')
+                            inp_words = emb_cos_nn.split(' ')
+                            for wi in range(len(per)):
+                                org_w = emb[wi]
+                                print(inp_words[wi] + ': ' + utils.to_sent(utils.nn_vec_L2(embed_mat, org_w, k=10, return_vals=False, xp=xp), unvocab))
+                            print('\n')
+
+                            print('Original (cosine) nearest neighbors')
+                            print(emb_cos_nn)
+                            print('Adversarial (cosine) nearest neighbors')
+                            print(adv_cos_nn)
+                            print('Perturbation (cosine) nearest neighbors')
+                            print(per_cos_nn)
+                            # print('Perturbation (L2) nearest neighbors')
+                            # print(per_l2_nn)
+                            # print(emb_l2_norm)
+                            # print(adv_l2_norm)
+                            # print(per_l2_norm)
+                            print('\n')
+
+
+                            # vec_good = embed_mat[tokenizer.vocab['good']]
+                            # vec_bad = embed_mat[tokenizer.vocab['bad']]
+                            # norm_good = utils.vec_normalize(vec_good, xp=xp)
+                            # norm_bad = utils.vec_normalize(vec_bad, xp=xp)
+                            # vec_NegativeDir = vec_bad - vec_good
+                            # norm_NegativeDir = utils.vec_normalize(vec_NegativeDir, xp=xp)
+                            # per_normed = utils.mat_normalize(per, xp=xp)
+                            # adv_normed = utils.mat_normalize(adv, xp=xp)
+                            # emb_normed = utils.mat_normalize(emb, xp=xp)
+                            # per_NegativeDir = xp.matmul(per_normed, norm_NegativeDir).tolist()
+                            # adv_good = [round(x, 4) for x in xp.matmul(adv_normed, norm_good).tolist()]
+                            # adv_bad = [round(x, 4) for x in xp.matmul(adv_normed, norm_bad).tolist()]
+                            # emb_good = [round(x, 4) for x in xp.matmul(emb_normed, norm_good).tolist()]
+                            # emb_bad = [round(x, 4) for x in xp.matmul(emb_normed, norm_bad).tolist()]
+                            # print(list(zip(per_cos_nn.split(' '), per_NegativeDir)))
+                            # print(list(zip(adv_cos_nn.split(' '), adv_good)))
+                            # print(list(zip(adv_cos_nn.split(' '), adv_bad)))
+                            # print(list(zip(emb_cos_nn.split(' '), emb_good)))
+                            # print(list(zip(emb_cos_nn.split(' '), emb_bad)))
+
+                            for coeff in [1.0,5.0,12.0]:
+                                per = adv-emb
+                                print(coeff)
+                                per = coeff * per
+                                per_cos_nn = []
+                                # per_l2_nn = []
+                                for wi in range(len(per)):
+                                    per_w = per[wi]
+                                    org_w = emb[wi]
+                                    rel_norm_embed = utils.mat_normalize(embed_mat - org_w, xp=xp)
+                                    nn_dir_w = get_vec_nn(model, per_w, unvocab, tokenizer.vocab, k=1, norm_embed=rel_norm_embed, xp=xp)
+                                    per_cos_nn.append(nn_dir_w)
+                                    # per_l2_nn.append(utils.to_sent(utils.nn_vec_L2(embed_mat - org_w, per_w, k=1, return_vals=False, xp=xp), unvocab))
+                                per_cos_nn = ' '.join(per_cos_nn)
+                                # per_l2_nn = ' '.join(per_l2_nn)
+                                per_l2_norm = xp.linalg.norm(per, axis=1).tolist()
+                                print('Perturbation (cosine) nearest neighbors')
+                                print(per_cos_nn)
+
+
+                            
+                            data = emb_cos_nn, adv_cos_nn, per_cos_nn, emb_l2_norm, adv_l2_norm, per_l2_norm
+                            metadata = {}
+                            metadata['name'] = FLAGS.output_dir + str(sequence_offset)
+                            metadata['epsilon'] = str(epsilon)
+                            metadata['adv_k'] = str(adv_k)
+                            metadata['label'] = str(prediction_test[seq_idx]) + 'to' + str(prediction_adv_test[seq_idx])
+                            create_plots(data, metadata, folder=FLAGS.output_dir)
+
+                            if num_examples >= max_examples:
+                                eval_iter.reset()
+                                return
+            
+            eval_iter.reset()
+        projection_demo(model, test_iter, converter, FLAGS.adv_epsilon, adv_k=1, xp=xp)
+        projection_demo(model, test_iter, converter, FLAGS.adv_epsilon/3, adv_k=3, xp=xp)
 
         with chainer.using_config('train', False):
             with chainer.no_backprop_mode():
                 data = test_iter.__next__()
                 input_ids, input_mask, segment_ids, label_id = converter(data, FLAGS.gpu)
-                # pooled_out = model.bert.get_pooled_output(input_ids, input_mask, segment_ids)
-                word_embeddings = model.bert.get_word_embeddings(input_ids, input_mask, segment_ids)
-                embedding_out = model.bert.get_embedding_output(input_ids, input_mask, segment_ids)
-                # logits = model(input_ids, input_mask, segment_ids, label_id, return_logits=True)
-                # probas = F.softmax(logits)
+                # pooled_out = model.bert.get_pooled_output(input_ids, input_mask, segment_ids).data
+                pre_embedding_out = model.bert.get_word_embeddings(input_ids, input_mask, segment_ids).data
+                embedding_out = model.bert.get_embedding_output(input_ids, input_mask, segment_ids).data
+
                 embed_mat = model.bert.word_embeddings.W.data
-                xp = model.bert.xp
                 norm_embed = utils.mat_normalize(embed_mat, xp=xp)
                 ex_sent = utils.to_sent(input_ids[0], unvocab)
                 nns = utils.to_sent(utils.nn_vec(embed_mat, embed_mat[tokenizer.vocab['bad']], k=20, xp=xp), unvocab)
