@@ -921,7 +921,6 @@ class Transformer(chainer.Chain):
         self.num_hidden_layers = num_hidden_layers
         self.hidden_dropout_prob = hidden_dropout_prob
         self.intermediate_act_fn = intermediate_act_fn
-        self.attention_probs_dropout_prob = attention_probs_dropout_prob
 
         with self.init_scope():
             for layer_idx in range(self.num_hidden_layers):
@@ -929,7 +928,7 @@ class Transformer(chainer.Chain):
                 layer = TransformerLayer(
                     hidden_size, intermediate_size,
                     num_attention_heads, attention_head_size,
-                    self.attention_probs_dropout_prob, initializer_range)
+                    attention_probs_dropout_prob, initializer_range)
                 setattr(self, layer_name, layer)
 
     def __call__(self, input_tensor, attention_mask,

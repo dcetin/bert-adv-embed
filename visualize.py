@@ -40,15 +40,16 @@ def process_data(data):
     emb_cos_nn, adv_cos_nn, per_cos_nn = np.asarray(emb_cos_nn), np.asarray(adv_cos_nn), np.asarray(per_cos_nn)
     return emb_cos_nn, adv_cos_nn, per_cos_nn, emb_norm, adv_norm, per_norm
 
-def create_plots(data, metadata, folder='temp'):
+def create_plots(data, metadata, folder='temp', save_norms=True):
     md = metadata
     emb_cos_nn, adv_cos_nn, per_cos_nn, emb_norm, adv_norm, per_norm = process_data(data)
     annot_nn = np.stack([emb_cos_nn, per_cos_nn, adv_cos_nn], axis=1)
     df = pd.DataFrame({'original': emb_norm, 'perturbation': per_norm, 'adversarial': adv_norm}, index=np.arange(emb_norm.size))
     df = df[['original', 'perturbation', 'adversarial']]
     # vmin = math.floor(df.values.min())
+    # vmin = df.values.min()
+    vmin = 0.0
     # vmax = math.ceil(df.values.max())
-    vmin = df.values.min()
     vmax = df.values.max()
 
     size_h = emb_cos_nn.size / 4.0
@@ -61,12 +62,13 @@ def create_plots(data, metadata, folder='temp'):
     plt.savefig(os.path.join(folder, md['name'] + '_adv_k' + md['adv_k'] + '_eps' + md['epsilon'] + '_nns.png'))
     plt.clf()
 
-    plt.figure(figsize=(size_w, size_h))
-    norm_plot = sns.heatmap(df, annot=True, fmt='.3f', cmap='YlOrRd', vmin=vmin, vmax=vmax)
-    norm_plot.set_xticklabels(norm_plot.get_xticklabels(), rotation=0)
-    plt.title(r'Norms, $\epsilon = $' + md['adv_k'] + 'x' + md['epsilon'] + ' ' + md['label'])
-    plt.savefig(os.path.join(folder, md['name'] + '_adv_k' + md['adv_k'] + '_eps' + md['epsilon'] + '_norms.png'))
-    plt.clf()
+    if save_norms:
+        plt.figure(figsize=(size_w, size_h))
+        norm_plot = sns.heatmap(df, annot=True, fmt='.3f', cmap='YlOrRd', vmin=vmin, vmax=vmax)
+        norm_plot.set_xticklabels(norm_plot.get_xticklabels(), rotation=0)
+        plt.title(r'Norms, $\epsilon = $' + md['adv_k'] + 'x' + md['epsilon'] + ' ' + md['label'])
+        plt.savefig(os.path.join(folder, md['name'] + '_adv_k' + md['adv_k'] + '_eps' + md['epsilon'] + '_norms.png'))
+        plt.clf()
 
 def main():
     data = get_sample_data()

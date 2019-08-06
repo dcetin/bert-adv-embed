@@ -38,10 +38,12 @@ import numpy as np
 
 _logger = logging.getLogger(__name__)
 
+import random
 import utils
-from chainer.backends.cuda import to_cpu
-import sys
 from visualize import create_plots
+from chainer.backends import cuda
+from chainer.backends.cuda import to_cpu
+# import pdb; pdb.set_trace()
 
 def get_arguments():
     parser = argparse.ArgumentParser(description='Arxiv')
@@ -113,8 +115,11 @@ def get_arguments():
         '--do_experiment', type=strtobool, default='False',
         help="Whether to experiment before exiting.")
     parser.add_argument(
-        '--adv_epsilon', type=float, default=0.5,
+        '--adv_epsilon', type=float, default=0.6,
         help="Adversarial perturbation coefficient.")
+    parser.add_argument(
+        '--random_seed', dest='random_seed', type=int, default=1234, 
+        help='Random seed.')
 
     # These args are NOT used in this port.
     parser.add_argument('--use_tpu', type=strtobool, default='False')
@@ -130,6 +135,11 @@ def get_arguments():
 
 FLAGS = get_arguments()
 
+# Seed the generators
+xp = cuda.cupy if FLAGS.gpu >= 0 else np
+xp.random.seed(FLAGS.random_seed)
+random.seed(FLAGS.random_seed)
+os.environ["CHAINER_SEED"] = str(FLAGS.random_seed)
 
 class InputExample(object):
     """A single training/test example for simple sequence classification."""
@@ -462,63 +472,29 @@ def _truncate_seq_pair(tokens_a, tokens_b, max_length):
 
 # New functions
 
-def adv_FGSM(model, data, epsilon=0.5, train=False):
-
+def adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=None, xp=np):
+    '''
+    k-step FGSM on word embeddings, returns perturbed embedding variable.
+    '''
     # Cannot seem to backprop on eval mode, so this seems like a possible workaround
     org_dropout = (model.output_dropout, 
         model.bert.dropout_prob, 
-        model.bert.encoder.hidden_dropout_prob, 
-        model.bert.encoder.attention_probs_dropout_prob)
+        model.bert.encoder.hidden_dropout_prob)
+    attn_dropout = []
+    for layer_idx in range(model.bert.encoder.num_hidden_layers):
+            layer_name = "layer_%d" % layer_idx
+            layer = getattr(model.bert.encoder, layer_name)
+            attn_dropout.append(layer.attention.attention_probs_dropout_prob)
+            if train is False:
+                layer.attention.attention_probs_dropout_prob = 0
     if train is False:
         model.output_dropout = 0.0
         model.bert.dropout_prob = 0.0
         model.bert.encoder.hidden_dropout_prob = 0.0
-        model.bert.encoder.attention_probs_dropout_prob = 0.0
 
     input_ids, input_mask, segment_ids, label_id = data
-    word_embed_lookup = model.bert.get_word_embeddings(input_ids, input_mask, segment_ids) # var: (64, 128, 768)
-    pooled_out = model.bert(input_ids, input_mask, segment_ids, 
-        feed_word_embeddings=True, input_word_embeddings=word_embed_lookup)
-    pred_logits = model.get_logits_from_output(pooled_out)
-    loss_eval = F.softmax_cross_entropy(pred_logits, label_id, normalize=True)
-    model.cleargrads()
-    adv_g = chainer.grad([loss_eval], [model.bert.word_embed_lookup])[0] # var: (64, 128, 768)
-
-    with chainer.using_config('train', False):
-        def sentence_level_norm(grads):
-            batchsize, embed_dim, maxlen = grads.shape
-            grads = F.reshape(grads, (batchsize, embed_dim * maxlen))
-            grads = F.normalize(grads, axis=1)
-            grads = F.reshape(grads, (batchsize, embed_dim, maxlen))
-            return grads
-
-        adv_p = epsilon * sentence_level_norm(adv_g) # sentence-level L_2
-        perturbed = word_embed_lookup + adv_p
-
-    # Restore dropout before returning
-    (model.output_dropout, 
-        model.bert.dropout_prob, 
-        model.bert.encoder.hidden_dropout_prob, 
-        model.bert.encoder.attention_probs_dropout_prob) = org_dropout
-
-    return perturbed
-
-def adv_FGSM_k(model, data, epsilon=0.5, k=3, train=False):
-
-    # Cannot seem to backprop on eval mode, so this seems like a possible workaround
-    org_dropout = (model.output_dropout, 
-        model.bert.dropout_prob, 
-        model.bert.encoder.hidden_dropout_prob, 
-        model.bert.encoder.attention_probs_dropout_prob)
-    if train is False:
-        model.output_dropout = 0.0
-        model.bert.dropout_prob = 0.0
-        model.bert.encoder.hidden_dropout_prob = 0.0
-        model.bert.encoder.attention_probs_dropout_prob = 0.0
-
-    input_ids, input_mask, segment_ids, label_id = data
-    word_embed_lookup = model.bert.get_word_embeddings(input_ids, input_mask, segment_ids) # var: (64, 128, 768)
-
+    org_embed_lookup = model.bert.get_word_embeddings(input_ids, input_mask, segment_ids) # var: (64, 128, 768)
+    word_embed_lookup = org_embed_lookup
 
     for i in range(k):
         pooled_out = model.bert(input_ids, input_mask, segment_ids, 
@@ -539,16 +515,36 @@ def adv_FGSM_k(model, data, epsilon=0.5, k=3, train=False):
             adv_p = epsilon * sentence_level_norm(adv_g) # sentence-level L_2
             word_embed_lookup = word_embed_lookup + adv_p
 
+    if sparsity_keep is not None:
+        with chainer.using_config('train', False):
+            def sparsify_perturb(data, mask, keep_prob=0.75, xp=np):
+                seqlens = xp.sum(mask, axis=1)
+                keep_counts = xp.floor(seqlens * keep_prob)
+                norms = xp.linalg.norm(data, axis=2)
+                thresh = data.shape[1] - keep_counts[:, xp.newaxis]
+                sort_ids = xp.argsort(xp.argsort(norms, axis=-1))
+                sparse_mask = (sort_ids > thresh).astype(int)
+                data[sparse_mask == 0] = 0
+                return data
+
+            sparse_perturbation = sparsify_perturb(
+                word_embed_lookup.data - org_embed_lookup.data, input_mask, keep_prob=sparsity_keep, xp=xp)
+            word_embed_lookup.data = org_embed_lookup.data + sparse_perturbation
 
     # Restore dropout before returning
     (model.output_dropout, 
         model.bert.dropout_prob, 
-        model.bert.encoder.hidden_dropout_prob, 
-        model.bert.encoder.attention_probs_dropout_prob) = org_dropout
+        model.bert.encoder.hidden_dropout_prob) = org_dropout
+    for layer_idx in range(model.bert.encoder.num_hidden_layers):
+            layer_name = "layer_%d" % layer_idx
+            layer = getattr(model.bert.encoder, layer_name)
+            layer.attention.attention_probs_dropout_prob = attn_dropout[layer_idx]
 
     return word_embed_lookup
 
-def evaluate_fn(eval_iter, device, model, converter, adversarial=False, k=1, epsilon=0.5):
+def evaluate_fn(eval_iter, device, model, converter, adversarial=False, sparsity_keep=None, adv_k=1, epsilon=0.6):
+    
+    xp = model.bert.xp
     eval_losses = []
     eval_accuracies = []
     for test_batch in eval_iter:
@@ -557,10 +553,8 @@ def evaluate_fn(eval_iter, device, model, converter, adversarial=False, k=1, eps
         input_ids, input_mask, segment_ids, label_id = data
 
         if adversarial:
-            if k == 1:
-                adv_word_embed_lookup = adv_FGSM(model, data, epsilon=epsilon, train=False)
-            else:
-                adv_word_embed_lookup = adv_FGSM_k(model, data, epsilon=epsilon, k=k, train=False)
+            adv_word_embed_lookup = adv_FGSM_k(model, data, 
+                epsilon=epsilon, k=adv_k, train=False, sparsity_keep=sparsity_keep, xp=xp)
 
         with chainer.using_config('train', False):
             with chainer.no_backprop_mode():
@@ -585,7 +579,12 @@ def evaluate_fn(eval_iter, device, model, converter, adversarial=False, k=1, eps
 
     return np.mean(eval_losses), np.mean(eval_accuracies)
 
-def get_seq_nn(model, seq, unvocab, norm_embed=None, project=False, xp=np):
+def get_seq_nn(model, seq, norm_embed=None, project=False, xp=np):
+    '''
+    Cosine nearest neighbors of given sequence of vectors in the word embedding lookup of the model.
+    '''
+    vocab = model.vocab
+    unvocab = model.unvocab
     if norm_embed is None:
         embed_mat = model.bert.word_embeddings.W.data
         norm_embed = utils.mat_normalize(embed_mat, xp=xp)
@@ -599,7 +598,12 @@ def get_seq_nn(model, seq, unvocab, norm_embed=None, project=False, xp=np):
     else:
         return utils.to_sent(seq_nn, unvocab)
 
-def get_vec_nn(model, inp, unvocab, vocab, k=10, return_vals=False, norm_embed=None, xp=np):
+def get_vec_nn(model, inp, k=10, return_vals=False, norm_embed=None, xp=np):
+    '''
+    Cosine nearest neighbors of given vector in the word embedding lookup of the model.
+    '''
+    vocab = model.vocab
+    unvocab = model.unvocab
     embed_mat = model.bert.word_embeddings.W.data
     if norm_embed is None:
         norm_embed = utils.mat_normalize(embed_mat, xp=xp)
@@ -621,10 +625,12 @@ def get_vec_nn(model, inp, unvocab, vocab, k=10, return_vals=False, norm_embed=N
         words = utils.to_sent(max_idx, unvocab)
         return words
 
-def analogy(model, unvocab, vocab, pos_words=None, neg_words=None, return_vals=False, xp=np):
+def analogy(model, pos_words=None, neg_words=None, return_vals=False, xp=np):
     '''
     Analogy on word embeddings examples.
     '''
+    vocab = model.vocab
+    unvocab = model.unvocab
     embed_mat = model.bert.word_embeddings.W.data
     norm_embed = utils.mat_normalize(embed_mat, xp=xp)
     if pos_words is None or neg_words is None:
@@ -640,27 +646,29 @@ def analogy(model, unvocab, vocab, pos_words=None, neg_words=None, return_vals=F
         neg_embed = xp.sum(xp.stack(neg_embed, axis=0), axis=0)
         forw = pos_embed - neg_embed
         if return_vals:
-            nns, vals = get_vec_nn(model, forw, unvocab, vocab, xp=xp, norm_embed=norm_embed, return_vals=True)
+            nns, vals = get_vec_nn(model, forw, xp=xp, norm_embed=norm_embed, return_vals=True)
             print(' '.join([nn + ' (' + str(val) + ')' for (nn,val) in list(zip(nns.split(' '), vals))]))
         else:
-            print(get_vec_nn(model, forw, unvocab, vocab, xp=xp, norm_embed=norm_embed))
+            print(get_vec_nn(model, forw, xp=xp, norm_embed=norm_embed))
     print('\n')
 
-def example_nn(model, unvocab, vocab, return_vals=False, xp=np):
-        '''
-        Nearest negihbor examples.
-        '''
-        embed_mat = model.bert.word_embeddings.W.data
-        norm_embed = utils.mat_normalize(embed_mat, xp=xp)
-        word_list = ['good', 'this', 'that', 'awesome', 'bad', 'wrong']
-        for word in word_list:
-            if return_vals:
-                nns, vals = get_vec_nn(model, word, unvocab, vocab, xp=xp, norm_embed=norm_embed, return_vals=True)
-                exstr = ' '.join([nn + ' (' + str(val) + ')' for (nn,val) in list(zip(nns.split(' '), vals))])
-                print(word + ': ' + exstr)
-            else:
-                print(word + ': ' + get_vec_nn(model, word, unvocab, vocab, xp=xp, norm_embed=norm_embed))
-        print('\n')
+def example_nn(model, return_vals=False, xp=np):
+    '''
+    Nearest negihbor examples.
+    '''
+    vocab = model.vocab
+    unvocab = model.unvocab
+    embed_mat = model.bert.word_embeddings.W.data
+    norm_embed = utils.mat_normalize(embed_mat, xp=xp)
+    word_list = ['good', 'this', 'that', 'awesome', 'bad', 'wrong']
+    for word in word_list:
+        if return_vals:
+            nns, vals = get_vec_nn(model, word, xp=xp, norm_embed=norm_embed, return_vals=True)
+            exstr = ' '.join([nn + ' (' + str(val) + ')' for (nn,val) in list(zip(nns.split(' '), vals))])
+            print(word + ': ' + exstr)
+        else:
+            print(word + ': ' + get_vec_nn(model, word, xp=xp, norm_embed=norm_embed))
+    print('\n')
 
 
 def main():
@@ -711,11 +719,17 @@ def main():
 
     bert = modeling.BertModel(config=bert_config)
     model = modeling.BertClassifier(bert, num_labels=len(label_list))
-    chainer.serializers.load_npz(
-        FLAGS.init_checkpoint, model,
-        ignore_names=['output/W', 'output/b'])
-
+    chainer.serializers.load_npz(FLAGS.init_checkpoint, model, ignore_names=['output/W', 'output/b'])
     converter = Converter(label_list, FLAGS.max_seq_length, tokenizer)
+
+    # Assign processing variables to model
+    unvocab = {}
+    for key, value in tokenizer.vocab.items():
+        unvocab[value] = key
+    model.vocab = tokenizer.vocab
+    model.unvocab = unvocab
+    model.converter = converter
+    # END
 
     if FLAGS.do_resume:
         # chainer.serializers.load_npz('./base_out_imdb/model_snapshot_iter_781.npz', model)
@@ -769,12 +783,31 @@ def main():
         eval_examples = processor.get_test_examples(FLAGS.data_dir)
         test_iter = chainer.iterators.SerialIterator(eval_examples, FLAGS.train_batch_size * 2, repeat=False, shuffle=False)
 
+        # test_loss, test_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter)
+        # print('[test ] loss:{:.04f} acc:{:.04f}'.format(test_loss, test_acc))
+
+        # test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
+        #     adv_k=1, epsilon=FLAGS.adv_epsilon, adversarial=True)
+        # print('[test  adv] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
+
         test_loss, test_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter)
         print('[test ] loss:{:.04f} acc:{:.04f}'.format(test_loss, test_acc))
-        test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, epsilon=FLAGS.adv_epsilon, adversarial=True)
-        print('[test  adv] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
-        # test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, k=3, epsilon=(FLAGS.adv_epsilon/3), adversarial=True)
-        # print('[test adv3] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
+
+        test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
+            adv_k=1, epsilon=0.6, adversarial=True)
+        print('[test 1x0.6] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
+
+        test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
+            adv_k=1, epsilon=0.6, adversarial=True, sparsity_keep=0.25)
+        print('[test 1x0.6[0.25]] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
+
+        test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
+            adv_k=3, epsilon=0.2, adversarial=True)
+        print('[test 3x0.2] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
+
+        test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
+            adv_k=3, epsilon=0.2, adversarial=True, sparsity_keep=0.25)
+        print('[test 3x0.2[0.25]] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
 
     # if you wanna see some output arrays for debugging
     if FLAGS.do_experiment:
@@ -782,41 +815,24 @@ def main():
         eval_examples = processor.get_test_examples(FLAGS.data_dir)
         test_iter = chainer.iterators.SerialIterator(eval_examples, FLAGS.train_batch_size * 2, repeat=False, shuffle=False)
         xp = model.bert.xp
-        unvocab = {}
-        for key, value in tokenizer.vocab.items():
-            unvocab[value] = key
 
         print('Some example nearest neighbors:')
-        example_nn(model, unvocab, tokenizer.vocab, return_vals=True, xp=xp)
+        example_nn(model, return_vals=True, xp=xp)
         print('Some example analogies:')
         print("Given 'king + woman - man', 'sad + good - bad', 'walked + went - walk', 'paris + rome - france', expecting queen, happy, go, italy")
-        analogy(model, unvocab, tokenizer.vocab, pos_words=None, neg_words=None, return_vals=True, xp=xp)
+        analogy(model, pos_words=None, neg_words=None, return_vals=True, xp=xp)
 
-        def projection_demo(model, eval_iter, converter, epsilon, adv_k=1, xp=np):
-
-            # Number of examples to generate
-            max_examples = 1
-            # Maximum sequence length to choose sequences from
-            max_seq_len = 90
-
+        def adversarial_demo(model, eval_iter, converter, epsilon, adv_k=1, max_examples=1, max_seq_len=50, prefix='', sparsity_keep=None, xp=np):
+            
             num_examples = 0
-            for bi, test_batch in enumerate(eval_iter):
+            for test_batch in eval_iter:
 
+                # Get the current batch of data and perturb the embeddings
                 data = converter(test_batch, FLAGS.gpu)
                 input_ids, input_mask, segment_ids, label_id = data
-
-                if adv_k == 1:
-                    adv_test_x = adv_FGSM(model, data, epsilon=epsilon, train=False)
-                else:
-                    adv_test_x = adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False)
-
-                # print('bi {} batchsize {} pos {}'.format(bi, len(test_batch), eval_iter.current_position))
-
-                # Sparsification here on the masked input?
+                adv_test_x = adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, sparsity_keep=sparsity_keep, xp=xp)
 
                 with chainer.using_config('train', False):
-
-                    embed_x = model.bert.get_word_embeddings(input_ids, input_mask, segment_ids)
 
                     # Prediction on original data
                     pred_logits = model(input_ids, input_mask, segment_ids, label_id, return_logits=True)
@@ -828,150 +844,169 @@ def main():
                     pred_logits = model.get_logits_from_output(pooled_out)
                     prediction_adv_test = xp.argmax(pred_logits.data, axis=1)
 
+                    # Compare predictions and get the indices of the adversarial examples
                     std = (prediction_test == label_id)
                     adv = (prediction_adv_test == label_id)
                     res = ~adv & std
                     res_ids = xp.where(res.astype(int) == 1)[0].tolist()
 
-                    adv_test_x = adv_test_x.data
+                    # Save the embedding arrays
+                    embed_x = model.bert.get_word_embeddings(input_ids, input_mask, segment_ids)
                     embed_x = embed_x.data
+                    adv_test_x = adv_test_x.data
 
-                    # print('groundtruth: {}'.format(label_id))
-                    # print('predictions: {}'.format(prediction_test))
-                    # print('adv.  preds: {}'.format(prediction_adv_test))
-                    # print('std: {}'.format(std.astype(int)))
-                    # print('adv: {}'.format(adv.astype(int)))
-                    # print('res: {}'.format(res.astype(int)))
-                    # print('std acc: {}'.format(std.mean()))
-                    # print('adv acc: {}'.format(adv.mean()))
+                    # Print indices and accuracies over the current batch
+                    '''
+                    print('groundtruth: {}'.format(label_id))
+                    print('predictions: {}'.format(prediction_test))
+                    print('adv.  preds: {}'.format(prediction_adv_test))
+                    print('std: {}'.format(std.astype(int)))
+                    print('adv: {}'.format(adv.astype(int)))
+                    print('res: {}'.format(res.astype(int)))
+                    print('std acc: {}'.format(std.mean()))
+                    print('adv acc: {}'.format(adv.mean()))
+                    '''
 
-                    # Iterate over all adversarial sequences, or pick the shortest one
+
                     if len(res_ids) > 0:
-                        # shortest = min(res_ids, key=lambda x:int(input_ids[x].size))
-                        # for seq_idx in [shortest]:
-                        for seq_idx in res_ids:
 
-                            seqlen = int(sum(input_mask[seq_idx].tolist()))
+                        # seqlen_list = [int(sum(x.tolist())) for x in input_mask]
+                        # shortest = min(input_mask, key=lambda x:int(sum(x.tolist())))
+                        # print('shortest', seqlen_list, shortest)
+                        # for seq_idx in [shortest]:
+
+                        # for seq_idx in range(res.shape[0]): # Iterate over ALL sequences in the batch, not the adversarial ones
+                        # for seq_idx in [0]: # Get just one example
+                        for seq_idx in res_ids: # Iterate over all adversarial sequences
 
                             # Iterate until finding a sufficiently short sequence
+                            seqlen = int(sum(input_mask[seq_idx].tolist()))
                             if max_seq_len is not None and seqlen > max_seq_len:
                                 continue
 
+                            # Print sequence metadata
                             sequence_offset = eval_iter.current_position + seq_idx - (FLAGS.train_batch_size * 2)
-
                             num_examples += 1
                             print('Visualizing example {}:'.format(num_examples))
                             print('seq_offset: {} of length {}'.format(sequence_offset, seqlen))
+                            print('groundtruth:', label_id[seq_idx], 'original:', prediction_test[seq_idx], 'adversarial:', prediction_adv_test[seq_idx])
 
-                            # Vectorised version
+
+                            # Get the matrices
                             embed_mat = model.bert.word_embeddings.W.data
                             norm_embed = utils.mat_normalize(embed_mat, xp=xp)
-
                             emb = embed_x[seq_idx]
                             adv = adv_test_x[seq_idx]
                             inp = input_ids[seq_idx]
 
+                            # Crop the sequences to avoid printing the padding
                             emb = emb[:seqlen]
                             adv = adv[:seqlen]
                             inp = input_ids[:seqlen]
 
-                            emb_cos_nn = get_seq_nn(model, emb, unvocab, norm_embed=norm_embed, xp=xp)
+                            # Calculate L2 norms and cosine nearest neighbors...
+                            # ... for the original embeddings
+                            emb_cos_nn = get_seq_nn(model, emb, norm_embed=norm_embed, xp=xp)
                             emb_l2_norm = xp.linalg.norm(emb, axis=1).tolist()
-
-                            adv_cos_nn = get_seq_nn(model, adv, unvocab, norm_embed=norm_embed, xp=xp)
+                            # ... for the adversarial embeddings
+                            adv_cos_nn = get_seq_nn(model, adv, norm_embed=norm_embed, xp=xp)
                             adv_l2_norm = xp.linalg.norm(adv, axis=1).tolist()
-
+                            # ... for the adversarial perturbations (also the L2-nns)
                             per = adv-emb
                             per_cos_nn = []
-                            # per_l2_nn = []
+                            per_l2_nn = []
                             for wi in range(len(per)):
                                 per_w = per[wi]
                                 org_w = emb[wi]
                                 rel_norm_embed = utils.mat_normalize(embed_mat - org_w, xp=xp)
-                                nn_dir_w = get_vec_nn(model, per_w, unvocab, tokenizer.vocab, k=1, norm_embed=rel_norm_embed, xp=xp)
+                                nn_dir_w = get_vec_nn(model, per_w, k=1, norm_embed=rel_norm_embed, xp=xp)
                                 per_cos_nn.append(nn_dir_w)
-                                # per_l2_nn.append(utils.to_sent(utils.nn_vec_L2(embed_mat - org_w, per_w, k=1, return_vals=False, xp=xp), unvocab))
+                                per_l2_nn.append(utils.to_sent(utils.nn_vec_L2(embed_mat - org_w, per_w, k=1, return_vals=False, xp=xp), unvocab))
                             per_cos_nn = ' '.join(per_cos_nn)
-                            # per_l2_nn = ' '.join(per_l2_nn)
+                            per_l2_nn = ' '.join(per_l2_nn)
                             per_l2_norm = xp.linalg.norm(per, axis=1).tolist()
 
+                            # Print L2 nearest neighbors of the original embeddings
+                            
                             print('L2 nearest neighbors of the original input:')
                             inp_words = emb_cos_nn.split(' ')
                             for wi in range(len(per)):
                                 org_w = emb[wi]
                                 print(inp_words[wi] + ': ' + utils.to_sent(utils.nn_vec_L2(embed_mat, org_w, k=10, return_vals=False, xp=xp), unvocab))
                             print('\n')
+                            
 
+                            # Print the nearest neighbors and norms
                             print('Original (cosine) nearest neighbors')
                             print(emb_cos_nn)
                             print('Adversarial (cosine) nearest neighbors')
                             print(adv_cos_nn)
+                            print('Perturbation (L2) nearest neighbors')
+                            print(per_l2_nn)
                             print('Perturbation (cosine) nearest neighbors')
                             print(per_cos_nn)
-                            # print('Perturbation (L2) nearest neighbors')
-                            # print(per_l2_nn)
                             # print(emb_l2_norm)
                             # print(adv_l2_norm)
                             # print(per_l2_norm)
                             print('\n')
 
+                            # Experiment with "sentiment-carrying" dimensions 
+                            '''
+                            vec_good = embed_mat[tokenizer.vocab['good']]
+                            vec_bad = embed_mat[tokenizer.vocab['bad']]
+                            norm_good = utils.vec_normalize(vec_good, xp=xp)
+                            norm_bad = utils.vec_normalize(vec_bad, xp=xp)
+                            vec_NegativeDir = vec_bad - vec_good
+                            norm_NegativeDir = utils.vec_normalize(vec_NegativeDir, xp=xp)
+                            per_normed = utils.mat_normalize(per, xp=xp)
+                            adv_normed = utils.mat_normalize(adv, xp=xp)
+                            emb_normed = utils.mat_normalize(emb, xp=xp)
+                            per_NegativeDir = xp.matmul(per_normed, norm_NegativeDir).tolist()
+                            adv_good = [round(x, 4) for x in xp.matmul(adv_normed, norm_good).tolist()]
+                            adv_bad = [round(x, 4) for x in xp.matmul(adv_normed, norm_bad).tolist()]
+                            emb_good = [round(x, 4) for x in xp.matmul(emb_normed, norm_good).tolist()]
+                            emb_bad = [round(x, 4) for x in xp.matmul(emb_normed, norm_bad).tolist()]
+                            print(list(zip(per_cos_nn.split(' '), per_NegativeDir)))
+                            print(list(zip(adv_cos_nn.split(' '), adv_good)))
+                            print(list(zip(adv_cos_nn.split(' '), adv_bad)))
+                            print(list(zip(emb_cos_nn.split(' '), emb_good)))
+                            print(list(zip(emb_cos_nn.split(' '), emb_bad)))
+                            '''
 
-                            # vec_good = embed_mat[tokenizer.vocab['good']]
-                            # vec_bad = embed_mat[tokenizer.vocab['bad']]
-                            # norm_good = utils.vec_normalize(vec_good, xp=xp)
-                            # norm_bad = utils.vec_normalize(vec_bad, xp=xp)
-                            # vec_NegativeDir = vec_bad - vec_good
-                            # norm_NegativeDir = utils.vec_normalize(vec_NegativeDir, xp=xp)
-                            # per_normed = utils.mat_normalize(per, xp=xp)
-                            # adv_normed = utils.mat_normalize(adv, xp=xp)
-                            # emb_normed = utils.mat_normalize(emb, xp=xp)
-                            # per_NegativeDir = xp.matmul(per_normed, norm_NegativeDir).tolist()
-                            # adv_good = [round(x, 4) for x in xp.matmul(adv_normed, norm_good).tolist()]
-                            # adv_bad = [round(x, 4) for x in xp.matmul(adv_normed, norm_bad).tolist()]
-                            # emb_good = [round(x, 4) for x in xp.matmul(emb_normed, norm_good).tolist()]
-                            # emb_bad = [round(x, 4) for x in xp.matmul(emb_normed, norm_bad).tolist()]
-                            # print(list(zip(per_cos_nn.split(' '), per_NegativeDir)))
-                            # print(list(zip(adv_cos_nn.split(' '), adv_good)))
-                            # print(list(zip(adv_cos_nn.split(' '), adv_bad)))
-                            # print(list(zip(emb_cos_nn.split(' '), emb_good)))
-                            # print(list(zip(emb_cos_nn.split(' '), emb_bad)))
-
-                            for coeff in [1.0,5.0,12.0]:
-                                per = adv-emb
-                                print(coeff)
-                                per = coeff * per
-                                per_cos_nn = []
-                                # per_l2_nn = []
-                                for wi in range(len(per)):
-                                    per_w = per[wi]
-                                    org_w = emb[wi]
-                                    rel_norm_embed = utils.mat_normalize(embed_mat - org_w, xp=xp)
-                                    nn_dir_w = get_vec_nn(model, per_w, unvocab, tokenizer.vocab, k=1, norm_embed=rel_norm_embed, xp=xp)
-                                    per_cos_nn.append(nn_dir_w)
-                                    # per_l2_nn.append(utils.to_sent(utils.nn_vec_L2(embed_mat - org_w, per_w, k=1, return_vals=False, xp=xp), unvocab))
-                                per_cos_nn = ' '.join(per_cos_nn)
-                                # per_l2_nn = ' '.join(per_l2_nn)
-                                per_l2_norm = xp.linalg.norm(per, axis=1).tolist()
-                                print('Perturbation (cosine) nearest neighbors')
-                                print(per_cos_nn)
-
-
-                            
+                            # Pack the data and visualize the adversarial example
                             data = emb_cos_nn, adv_cos_nn, per_cos_nn, emb_l2_norm, adv_l2_norm, per_l2_norm
                             metadata = {}
-                            metadata['name'] = FLAGS.output_dir + str(sequence_offset)
+                            metadata['name'] = FLAGS.output_dir + prefix + str(sequence_offset)
                             metadata['epsilon'] = str(epsilon)
                             metadata['adv_k'] = str(adv_k)
                             metadata['label'] = str(prediction_test[seq_idx]) + 'to' + str(prediction_adv_test[seq_idx])
-                            create_plots(data, metadata, folder=FLAGS.output_dir)
+                            create_plots(data, metadata, folder=FLAGS.output_dir, save_norms=True)
 
+                            # Exit function if enough examples are created
                             if num_examples >= max_examples:
                                 eval_iter.reset()
                                 return
             
+            # Reset the iterator before returning
             eval_iter.reset()
-        projection_demo(model, test_iter, converter, FLAGS.adv_epsilon, adv_k=1, xp=xp)
-        projection_demo(model, test_iter, converter, FLAGS.adv_epsilon/3, adv_k=3, xp=xp)
+            return
+
+        # print('EXPERIMENT 0.6, adv_k=1 _sparse')
+        # adversarial_demo(model, test_iter, converter, 0.6, adv_k=1, max_examples=20, max_seq_len=60, sparsity_keep=0.25, xp=xp, prefix='_sparse')
+        print('EXPERIMENT 0.6, adv_k=1 _normal')
+        adversarial_demo(model, test_iter, converter, 0.6, adv_k=1, max_examples=20, max_seq_len=60, sparsity_keep=None, xp=xp, prefix='_normal')
+        # print('EXPERIMENT 0.2, adv_k=3 _sparse')
+        # adversarial_demo(model, test_iter, converter, 0.2, adv_k=3, max_examples=20, max_seq_len=60, sparsity_keep=0.25, xp=xp, prefix='_sparse')
+        print('EXPERIMENT 0.2, adv_k=3 _normal')
+        adversarial_demo(model, test_iter, converter, 0.2, adv_k=3, max_examples=20, max_seq_len=60, sparsity_keep=None, xp=xp, prefix='_normal')
+        # print('EXPERIMENT 6.0, adv_k=1 _sparse')
+        # adversarial_demo(model, test_iter, converter, 6.0, adv_k=1, max_examples=20, max_seq_len=60, sparsity_keep=0.25, xp=xp, prefix='_sparse')
+        # print('EXPERIMENT 6.0, adv_k=1 _normal')
+        # adversarial_demo(model, test_iter, converter, 6.0, adv_k=1, max_examples=20, max_seq_len=60, sparsity_keep=None, xp=xp, prefix='_normal')
+        # print('EXPERIMENT 2.0, adv_k=3 _sparse')
+        # adversarial_demo(model, test_iter, converter, 2.0, adv_k=3, max_examples=20, max_seq_len=60, sparsity_keep=0.25, xp=xp, prefix='_sparse')
+        # print('EXPERIMENT 2.0, adv_k=3 _normal')
+        # adversarial_demo(model, test_iter, converter, 2.0, adv_k=3, max_examples=20, max_seq_len=60, sparsity_keep=None, xp=xp, prefix='_normal')
 
         with chainer.using_config('train', False):
             with chainer.no_backprop_mode():
@@ -985,7 +1020,7 @@ def main():
                 norm_embed = utils.mat_normalize(embed_mat, xp=xp)
                 ex_sent = utils.to_sent(input_ids[0], unvocab)
                 nns = utils.to_sent(utils.nn_vec(embed_mat, embed_mat[tokenizer.vocab['bad']], k=20, xp=xp), unvocab)
-                # import pdb; pdb.set_trace()
+                
 
 
 if __name__ == "__main__":
