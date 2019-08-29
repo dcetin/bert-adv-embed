@@ -64,3 +64,21 @@ def nn_vec_L2(mat, vec, k=1, return_vals=False, xp=np):
         return nns, norms[nns]
     else:
         return nns
+
+def cosine_seq(seq1, seq2, epsilon=1e-12, xp=np):
+    '''
+    Returns the piecewise cosine similarities of two sequences.
+    '''
+    seq1 = mat_normalize(seq1, epsilon=epsilon, xp=xp)
+    seq2 = mat_normalize(seq2, epsilon=epsilon, xp=xp)
+    cos = xp.clip(xp.sum(seq1 * seq2, axis=1), 0.0, 1.0)
+    return cos
+
+def cosine_vec(seq1, seq2, epsilon=1e-12, xp=np):
+    '''
+    Returns the cosine similarity of two vectors.
+    '''
+    vec1 = vec_normalize(vec1, epsilon=epsilon, xp=xp)
+    vec2 = vec_normalize(vec2, epsilon=epsilon, xp=xp)
+    cos = xp.clip(xp.dot(vec1 * vec2), 0.0, 1.0)
+    return cos
