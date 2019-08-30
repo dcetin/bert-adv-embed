@@ -40,7 +40,7 @@ _logger = logging.getLogger(__name__)
 
 import random
 import utils
-from visualize import create_plots
+from visualize import create_adv_table, summary_histogram
 from chainer.backends import cuda
 from chainer.backends.cuda import to_cpu
 import pickle
@@ -138,6 +138,7 @@ FLAGS = get_arguments()
 
 # Seed the generators
 xp = cuda.cupy if FLAGS.gpu >= 0 else np
+np.random.seed(FLAGS.random_seed)
 xp.random.seed(FLAGS.random_seed)
 random.seed(FLAGS.random_seed)
 os.environ["CHAINER_SEED"] = str(FLAGS.random_seed)
@@ -1189,7 +1190,7 @@ def main():
                             metadata['label'] = str(prediction_test[seq_idx]) + 'to' + str(prediction_adv_test[seq_idx])
                             metadata['name'] = FLAGS.output_dir + prefix + str(sequence_offset)
 
-                            create_plots(data, metadata, folder=FLAGS.output_dir, save_norms=True)
+                            create_adv_table(data, metadata, folder=FLAGS.output_dir, save_norms=True)
 
                             # Exit function if enough examples are created
                             if num_examples >= max_examples:
@@ -1278,43 +1279,134 @@ def main():
                     #     pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
                     #     pickle.dump(metadata, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
-                    create_plots(data, metadata, folder=FLAGS.output_dir, save_norms=True)
+                    create_adv_table(data, metadata, folder=FLAGS.output_dir, save_norms=True)
 
+        def summary_statistics(model, eval_examples, verbose=False, xp=np):
 
-        # for ex_index in [58, 242]:
-        # for ex_index in [206, 266, 1714]:
-        # for ex_index in [433, 875]:
+            k = 6
+            m = 5
+            n = 10000
 
-            # adv_demo_by_index(model, eval_examples, ex_index, epsilon=0.6, adv_k=1, prefix='_normal', sparsity_keep=None, proj=False, xp=xp)
-            # adv_demo_by_index(model, eval_examples, ex_index, epsilon=0.6, adv_k=1, prefix='_sparse', sparsity_keep=0.25, proj=False, xp=xp)
-            # adv_demo_by_index(model, eval_examples, ex_index, epsilon=0.2, adv_k=3, prefix='_normal', sparsity_keep=None, proj=False, xp=xp)
-            # adv_demo_by_index(model, eval_examples, ex_index, epsilon=0.2, adv_k=3, prefix='_sparse', sparsity_keep=0.25, proj=False, xp=xp)
+            cosnn_cosines_list = []
+            random_cosines_list = []
+            random_eucs_list = []
+            eucnn_eucs_list = []
+            eucnn_cosines_list = []
+            cosnn_eucs_list = []
 
-            # adv_demo_by_index(model, eval_examples, ex_index, epsilon=3.0, adv_k=1, prefix='_sparse', sparsity_keep=0.25, xp=xp)
-            # adv_demo_by_index(model, eval_examples, ex_index, epsilon=5.0, adv_k=1, prefix='_sparse', sparsity_keep=0.25, xp=xp)
-            # adv_demo_by_index(model, eval_examples, ex_index, epsilon=6.0, adv_k=1, prefix='_sparse', sparsity_keep=0.25, xp=xp)
-            # adv_demo_by_index(model, eval_examples, ex_index, epsilon=7.0, adv_k=1, prefix='_sparse', sparsity_keep=0.25, xp=xp)
-            # adv_demo_by_index(model, eval_examples, ex_index, epsilon=10.0, adv_k=1, prefix='_sparse', sparsity_keep=0.25, xp=xp)
+            dataset_len = len(eval_examples)
+            embed_mat = model.bert.word_embeddings.W.data
+            norm_embed = utils.mat_normalize(embed_mat, xp=xp)
+            eval_examples_array = np.array(eval_examples)
+            if verbose:
+                print('dataset_len: {}'.format(dataset_len))
 
-        # adv_demo_by_index(model, eval_examples, 266, epsilon=6.0, adv_k=1, prefix='_sparse', sparsity_keep=0.25, xp=xp)
-        adv_demo_by_index(model, eval_examples, 1714, epsilon=7.0, adv_k=1, prefix='_sparse', sparsity_keep=0.25, xp=xp)
+            counter = 0
 
-        # print('EXPERIMENT 0.6, adv_k=1 _sparse')
-        # adversarial_demo(model, test_iter, 0.6, adv_k=1, max_examples=20, max_seq_len=60, sparsity_keep=0.25, xp=xp, prefix='_sparse')
-        # print('EXPERIMENT 0.6, adv_k=1 _normal')
-        # adversarial_demo(model, test_iter, 0.6, adv_k=1, max_examples=20, max_seq_len=60, sparsity_keep=None, xp=xp, prefix='_normal')
-        # print('EXPERIMENT 0.2, adv_k=3 _sparse')
-        # adversarial_demo(model, test_iter, 0.2, adv_k=3, max_examples=20, max_seq_len=60, sparsity_keep=0.25, xp=xp, prefix='_sparse')
-        # print('EXPERIMENT 0.2, adv_k=3 _normal')
-        # adversarial_demo(model, test_iter, 0.2, adv_k=3, max_examples=1, max_seq_len=60, sparsity_keep=None, xp=xp, prefix='_normal')
-        # print('EXPERIMENT 6.0, adv_k=1 _sparse')
-        # adversarial_demo(model, test_iter, 6.0, adv_k=1, max_examples=20, max_seq_len=60, sparsity_keep=0.25, xp=xp, prefix='_sparse')
-        # print('EXPERIMENT 6.0, adv_k=1 _normal')
-        # adversarial_demo(model, test_iter, 6.0, adv_k=1, max_examples=20, max_seq_len=60, sparsity_keep=None, xp=xp, prefix='_normal')
-        # print('EXPERIMENT 2.0, adv_k=3 _sparse')
-        # adversarial_demo(model, test_iter, 2.0, adv_k=3, max_examples=20, max_seq_len=60, sparsity_keep=0.25, xp=xp, prefix='_sparse')
-        # print('EXPERIMENT 2.0, adv_k=3 _normal')
-        # adversarial_demo(model, test_iter, 2.0, adv_k=3, max_examples=20, max_seq_len=60, sparsity_keep=None, xp=xp, prefix='_normal')
+            for i in range(n):
+
+                # Pick a random sequence
+                seq_idx = np.random.randint(dataset_len, size=1)[0]
+                data = model.converter([eval_examples[seq_idx]], FLAGS.gpu)
+                input_ids, input_mask, segment_ids, label_id = data
+                if verbose:
+                    print('seq_idx: {}'.format(seq_idx))
+
+                # Pick a random token from that sequence
+                seqlen = int(sum(input_mask[0].tolist()))
+                tok_offset = np.random.randint(seqlen, size=1)[0]
+                tok_idx = input_ids[0, tok_offset].tolist()
+                tok_word = model.unvocab[tok_idx]
+                if verbose:
+                    print('tok_offset: {}'.format(tok_offset))
+                    print('tok_idx: {}'.format(tok_idx))
+                    print('tok_word: {}'.format(tok_word))
+
+                # Get k Euclidean nearest neighbors of the word
+                eucnn_tok_ids, eucnn_eucs = utils.nn_vec_L2(embed_mat, embed_mat[tok_idx], k=k, return_vals=True, xp=xp)
+                eucnn_words = [model.unvocab[w] for w in eucnn_tok_ids.tolist()]
+                if verbose:
+                    print('eucnn_words: {}'.format(eucnn_words))
+                    print('eucnn_eucs: {}'.format(eucnn_eucs))
+
+                # Get k cosine nearest neighbors of the word
+                cosnn_words, cosnn_cosines = get_vec_nn(model, tok_idx, k=k, return_vals=True, norm_embed=None, xp=xp)
+                cosnn_tok_ids = [model.vocab[x] for x in cosnn_words.split(' ')]
+                if verbose:
+                    print('cosnn_words: {}'.format(cosnn_words))
+                    print('cosnn_cosines: {}'.format(cosnn_cosines))
+
+                # Calculate the Euclidean distances w.r.t. cosine nearest neighbors
+                cosnn_eucs = xp.linalg.norm(embed_mat[cosnn_tok_ids] - embed_mat[tok_idx], axis=1)
+                if verbose:
+                    print('cosnn_eucs: {}'.format(cosnn_eucs))
+
+                # Calculate the cosine similarities w.r.t. Euclidean nearest neighbors
+                eucnn_cosines = xp.matmul(norm_embed[eucnn_tok_ids], norm_embed[tok_idx])
+                if verbose:
+                    print('eucnn_cosines: {}'.format(eucnn_cosines))
+
+                # Pick m random sequences
+                seq_ids = np.random.randint(dataset_len, size=m)
+                pls = eval_examples_array[seq_ids]
+                data = model.converter(pls, FLAGS.gpu)
+                input_ids, input_mask, segment_ids, label_id = data
+                if verbose:
+                    print('seq_ids: {}'.format(seq_ids))
+
+                # Pick a random token from each of those sequences
+                seqlens = xp.sum(input_mask, axis=1).astype(int).tolist()
+                rand_tok_offsets = [np.random.randint(seqlen, size=1)[0] for seqlen in seqlens]
+                rand_tok_ids = [input_ids[i, tok_offset].tolist() for (i,tok_offset) in enumerate(rand_tok_offsets)]
+                rand_tok_words = [model.unvocab[rti] for rti in rand_tok_ids]
+                rand_tok_ids = xp.array(rand_tok_ids)
+                if verbose:
+                    print('rand_tok_offsets: {}'.format(rand_tok_offsets))
+                    print('rand_tok_ids: {}'.format(rand_tok_ids))
+                    print('rand_tok_words: {}'.format(rand_tok_words))
+
+                # Calculate cosine similarity w.r.t. each sampled token
+                random_cosines = xp.matmul(norm_embed[rand_tok_ids], norm_embed[tok_idx])
+                if verbose:
+                    print('random_cosines: {}'.format(random_cosines))
+
+                # Calculate Euclidean distance w.r.t. each sampled token
+                random_eucs = xp.linalg.norm(embed_mat[rand_tok_ids] - embed_mat[tok_idx], axis=1)
+                if verbose:
+                    print('random_eucs: {}'.format(random_eucs))
+
+                # Append new entries to respective lists
+                random_cosines_list.append(xp.array(random_cosines))
+                random_eucs_list.append(xp.array(random_eucs))
+                cosnn_cosines_list.append(xp.array(cosnn_cosines))
+                eucnn_eucs_list.append(xp.array(eucnn_eucs))
+                eucnn_cosines_list.append(xp.array(eucnn_cosines))
+                cosnn_eucs_list.append(xp.array(cosnn_eucs))
+
+                if verbose:
+                    print(' ')
+
+                counter += 1
+
+            random_cosines = xp.asnumpy(xp.stack(random_cosines_list))
+            random_eucs = xp.asnumpy(xp.stack(random_eucs_list))
+            cosnn_cosines = xp.asnumpy(xp.stack(cosnn_cosines_list))
+            eucnn_eucs = xp.asnumpy(xp.stack(eucnn_eucs_list))
+            eucnn_cosines = xp.asnumpy(xp.stack(eucnn_cosines_list))
+            cosnn_eucs = xp.asnumpy(xp.stack(cosnn_eucs_list))
+
+            # pik_file = 'summary_data_10000_5_5.pickle'
+            # with open(os.path.join('./', pik_file), 'wb') as handle:
+            #     pickle.dump(random_cosines, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            #     pickle.dump(random_eucs, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            #     pickle.dump(cosnn_cosines, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            #     pickle.dump(eucnn_eucs, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            #     pickle.dump(eucnn_cosines, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            #     pickle.dump(cosnn_eucs, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+            summary_histogram(cosnn_cosines, random_cosines, eucnn_cosines, folder=FLAGS.output_dir)
+
+        summary_statistics(model, eval_examples, xp=xp)
 
         with chainer.using_config('train', False):
             with chainer.no_backprop_mode():
