@@ -776,7 +776,7 @@ def get_adv_example(model, emb, adv, inp):
     data['cos_emb_adv'] = cos_emb_adv
     return data
 
-def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=None, token_budget=0.15, xp=np):
+def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=None, token_budget=0.15, redundancy=True, max_step=50, xp=np):
     '''
     k-step FGSM on word embeddings, returns perturbed embedding variable.
     '''
@@ -814,7 +814,6 @@ def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=No
 
     # Set parameters for iteration over Projected FGSM steps
     step = 0
-    max_step = 100
     token_budget = int(token_budget * input_ids.size)
     retval = None
     verbose = False
@@ -905,24 +904,26 @@ def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=No
                 if res[0]:
 
                     # NAIVE REDUNDANCY CHECK
-                    while True:
-                        new_diff_ids = []
-                        for (e, (w1,w2)) in diff_ids:
-                            temp_ids = xp.copy(adv_cos_nn_ids)
-                            temp_ids[0,e] = input_ids[0,e]
-                            pred_logits = model(temp_ids, input_mask, segment_ids, label_id, return_logits=True)
-                            prediction_adv_test = xp.argmax(pred_logits.data, axis=1)
-                            adv = (prediction_adv_test == label_id)
-                            res = ~adv & std
-                            if res[0]:
-                                print((e, (w1,w2)), 'is redundant')
-                                adv_cos_nn_ids[0,e] = input_ids[0,e]
+                    if redundancy:
+                        while True:
+                            new_diff_ids = []
+                            for (e, (w1,w2)) in diff_ids:
+                                temp_ids = xp.copy(adv_cos_nn_ids)
+                                temp_ids[0,e] = input_ids[0,e]
+                                pred_logits = model(temp_ids, input_mask, segment_ids, label_id, return_logits=True)
+                                prediction_adv_test = xp.argmax(pred_logits.data, axis=1)
+                                adv = (prediction_adv_test == label_id)
+                                res = ~adv & std
+                                if res[0]:
+                                    if verbose:
+                                        print((e, (w1,w2)), 'is redundant')
+                                    adv_cos_nn_ids[0,e] = input_ids[0,e]
+                                else:
+                                    new_diff_ids.append((e, (w1,w2)))
+                            if new_diff_ids == diff_ids:
+                                break
                             else:
-                                new_diff_ids.append((e, (w1,w2)))
-                        if new_diff_ids == diff_ids:
-                            break
-                        else:
-                            diff_ids = new_diff_ids
+                                diff_ids = new_diff_ids
 
                     retval = adv_cos_nn_ids
                     break
@@ -944,13 +945,14 @@ def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=No
             layer.attention.attention_probs_dropout_prob = attn_dropout[layer_idx]
     # -------------------------------------------------------------------------------
 
-    if retval is None:
-        if step > max_step:
-            print('Step limit ({}) exceeded.\n'.format(max_step))
-        elif len(diff_tokens) > token_budget:
-            print('Token budget ({}) exceeded.\n'.format(token_budget))
-    else:
-        print('Adversarial text found with {} changes (<{}).\n'.format(len(diff_ids), token_budget))
+    if verbose:
+        if retval is None:
+            if step > max_step:
+                print('Step limit ({}) exceeded.\n'.format(max_step))
+            elif len(diff_tokens) > token_budget:
+                print('Token budget ({}) exceeded.\n'.format(token_budget))
+        else:
+            print('Adversarial text found with {} changes (<{}).\n'.format(len(diff_ids), token_budget))
     return retval
 
 
@@ -1201,21 +1203,31 @@ def main():
             eval_iter.reset()
             return
 
-        def adv_demo_by_index(model, eval_examples, sequence_offset, epsilon, adv_k=1, prefix='', sparsity_keep=None, proj=True, xp=np):
-            data = model.converter([eval_examples[sequence_offset]], FLAGS.gpu)
-            input_ids, input_mask, segment_ids, label_id = data
-            if proj:
-                adv_test_x_ids = proj_adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, sparsity_keep=sparsity_keep, xp=xp)
-                if adv_test_x_ids is None:
-                    return None
-            else:
-                adv_test_x_embed = adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, sparsity_keep=sparsity_keep, xp=xp)
+        def adv_demo_by_index(model, eval_examples, sequence_offset, epsilon, adv_k=1, prefix='', sparsity_keep=None, proj=True, create_table=False, xp=np):
 
             with chainer.using_config('train', False):
+                data = model.converter([eval_examples[sequence_offset]], FLAGS.gpu)
+                input_ids, input_mask, segment_ids, label_id = data
 
                 # Prediction on original data
                 pred_logits = model(input_ids, input_mask, segment_ids, label_id, return_logits=True)
                 prediction_test = xp.argmax(pred_logits.data, axis=1)
+                std = (prediction_test == label_id)
+
+                # Check if the original prediction is correct or wrong
+                if not std[0]:
+                    return None
+
+            if proj:
+                adv_test_x_ids = proj_adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, sparsity_keep=sparsity_keep, xp=xp)
+
+                # Check if an adversarial example is found
+                if adv_test_x_ids is None:
+                    return False
+            else:
+                adv_test_x_embed = adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, sparsity_keep=sparsity_keep, xp=xp)
+
+            with chainer.using_config('train', False):
 
                 # Prediction on adversarial data
                 if proj:
@@ -1230,28 +1242,32 @@ def main():
                     prediction_adv_test = xp.argmax(pred_logits.data, axis=1)
 
                 # Compare predictions and get the indices of the adversarial examples
-                std = (prediction_test == label_id)
                 adv = (prediction_adv_test == label_id)
                 res = ~adv & std
                 res_ids = xp.where(res.astype(int) == 1)[0].tolist()
 
-                # Save the embedding arrays
-                embed_x = model.bert.get_word_embeddings(input_ids, input_mask, segment_ids)
-                embed_x = embed_x.data
-                
-                # Get adversarial embeddings if using adversarial text as input
-                if proj:
-                    adv_test_x = model.bert.get_word_embeddings(adv_test_x_ids, input_mask, segment_ids)
-                else:
-                    adv_test_x = adv_test_x_embed
-                adv_test_x = adv_test_x.data
+                if not res[0]:
+                    return False
 
-                # Print indices and accuracies over the current batch
-                print('groundtruth: {}'.format(label_id))
-                print('predictions: {}'.format(prediction_test))
-                print('adv.  preds: {}'.format(prediction_adv_test))
+                if create_table:
+                    # Save the embedding arrays
+                    embed_x = model.bert.get_word_embeddings(input_ids, input_mask, segment_ids)
+                    embed_x = embed_x.data
+                    
+                    # Get adversarial embeddings if using adversarial text as input
+                    if proj:
+                        adv_test_x = model.bert.get_word_embeddings(adv_test_x_ids, input_mask, segment_ids)
+                    else:
+                        adv_test_x = adv_test_x_embed
+                    adv_test_x = adv_test_x.data
 
-                for seq_idx in range(res.shape[0]):
+                    # Print indices and accuracies over the current batch
+                    print('groundtruth: {}'.format(label_id))
+                    print('predictions: {}'.format(prediction_test))
+                    print('adv.  preds: {}'.format(prediction_adv_test))
+
+                    # Only one example
+                    seq_idx = 0
 
                     # Print sequence metadata
                     seqlen = int(sum(input_mask[seq_idx].tolist()))
@@ -1280,6 +1296,8 @@ def main():
                     #     pickle.dump(metadata, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
                     create_adv_table(data, metadata, folder=FLAGS.output_dir, save_norms=True)
+
+                return True
 
         def summary_statistics(model, eval_examples, verbose=False, xp=np):
 
@@ -1406,22 +1424,29 @@ def main():
 
             summary_histogram(cosnn_cosines, random_cosines, eucnn_cosines, folder=FLAGS.output_dir)
 
-        summary_statistics(model, eval_examples, xp=xp)
+        def ugly_adv_iterator(model, eval_examples, xp=np):
+            emb_02_3_normal_counter = 0
+            proj_7_normal_counter = 0
+            all_counter = 0
+            correct_pred_counter = 0
 
-        with chainer.using_config('train', False):
-            with chainer.no_backprop_mode():
-                data = test_iter.__next__()
-                input_ids, input_mask, segment_ids, label_id = converter(data, FLAGS.gpu)
-                # pooled_out = model.bert.get_pooled_output(input_ids, input_mask, segment_ids).data
-                pre_embedding_out = model.bert.get_word_embeddings(input_ids, input_mask, segment_ids).data
-                embedding_out = model.bert.get_embedding_output(input_ids, input_mask, segment_ids).data
+            for ex_index in range(200):
+                all_counter += 1
+                emb_02_3_normal = adv_demo_by_index(model, eval_examples, ex_index, epsilon=0.2, adv_k=3, prefix='_normal', create_table=True, proj=False, xp=xp)
+                if emb_02_3_normal is not None:
+                    proj_7_normal = adv_demo_by_index(model, eval_examples, ex_index, epsilon=7.0, adv_k=1, prefix='_normal', create_table=True, xp=xp)
+                    correct_pred_counter += 1
+                    if emb_02_3_normal:
+                        emb_02_3_normal_counter += 1
+                    if proj_7_normal:
+                        proj_7_normal_counter += 1
 
-                embed_mat = model.bert.word_embeddings.W.data
-                norm_embed = utils.mat_normalize(embed_mat, xp=xp)
-                ex_sent = utils.to_sent(input_ids[0], unvocab)
-                nns = utils.to_sent(utils.nn_vec(embed_mat, embed_mat[tokenizer.vocab['bad']], k=20, xp=xp), unvocab)
-                
+            print('emb_02_3_normal_counter: {}'.format(emb_02_3_normal_counter))
+            print('proj_7_normal_counter: {}'.format(proj_7_normal_counter))
+            print('all_counter: {}'.format(all_counter))
+            print('correct_pred_counter: {}'.format(correct_pred_counter))
 
+        ugly_adv_iterator(model, eval_examples, xp=xp)
 
 if __name__ == "__main__":
     main()
