@@ -39,11 +39,10 @@ import numpy as np
 _logger = logging.getLogger(__name__)
 
 import random
-import utils
-from visualize import create_adv_table, summary_histogram
-from chainer.backends import cuda
-from chainer.backends.cuda import to_cpu
 import pickle
+import utils
+import visualize
+from chainer.backends.cuda import to_cpu
 # import pdb; pdb.set_trace()
 
 def get_arguments():
@@ -133,11 +132,10 @@ def get_arguments():
     args = parser.parse_args()
     return args
 
-
 FLAGS = get_arguments()
 
 # Seed the generators
-xp = cuda.cupy if FLAGS.gpu >= 0 else np
+xp = chainer.backends.cuda.cupy if FLAGS.gpu >= 0 else np
 np.random.seed(FLAGS.random_seed)
 xp.random.seed(FLAGS.random_seed)
 random.seed(FLAGS.random_seed)
@@ -585,99 +583,6 @@ def evaluate_fn(eval_iter, device, model, converter, adversarial=False, sparsity
 
     return np.mean(eval_losses), np.mean(eval_accuracies)
 
-def get_seq_nn(model, seq, norm_embed=None, project=False, get_ids=False, xp=np):
-    '''
-    Cosine nearest neighbors of given sequence of vectors in the word embedding lookup of the model.
-    '''
-    vocab = model.vocab
-    unvocab = model.unvocab
-    if norm_embed is None:
-        embed_mat = model.bert.word_embeddings.W.data
-        norm_embed = utils.mat_normalize(embed_mat, xp=xp)
-    seq_norm = utils.mat_normalize(seq, xp=xp)
-    seq_nn = xp.matmul(norm_embed, seq_norm.T)
-    seq_nn = xp.argmax(seq_nn, axis=0)
-
-    if project:
-        units = norm_embed[seq_nn]
-        return xp.multiply(units, seq)
-    elif get_ids:
-        return seq_nn
-    else:
-        return utils.to_sent(seq_nn, unvocab)
-
-def get_vec_nn(model, inp, k=10, return_vals=False, norm_embed=None, xp=np):
-    '''
-    Cosine nearest neighbors of given vector in the word embedding lookup of the model.
-    '''
-    vocab = model.vocab
-    unvocab = model.unvocab
-    embed_mat = model.bert.word_embeddings.W.data
-    if norm_embed is None:
-        norm_embed = utils.mat_normalize(embed_mat, xp=xp)
-
-    if type(inp) == str:            # input is a word
-        norm_forw = utils.vec_normalize(embed_mat[vocab[inp]], xp=xp)
-    elif type(inp) == int:          # input is a vocabulary index
-        norm_forw = utils.vec_normalize(embed_mat[inp], xp=xp)
-    elif type(inp) == xp.ndarray:   # input is an embedding vector
-        norm_forw = utils.vec_normalize(inp, xp=xp)
-    else:
-        logger.error('Unsupported input format for nearest neighbors.')
-    
-    max_idx = utils.nn_vec(norm_embed, norm_forw, k=k, normalize=False, xp=xp, return_vals=return_vals)
-    if return_vals:
-        words = utils.to_sent(max_idx[0], unvocab)
-        return words, [round(x, 5) for x in max_idx[1].tolist()]
-    else:
-        words = utils.to_sent(max_idx, unvocab)
-        return words
-
-def analogy(model, pos_words=None, neg_words=None, return_vals=False, xp=np):
-    '''
-    Analogy on word embeddings examples.
-    '''
-    vocab = model.vocab
-    unvocab = model.unvocab
-    embed_mat = model.bert.word_embeddings.W.data
-    norm_embed = utils.mat_normalize(embed_mat, xp=xp)
-    if pos_words is None or neg_words is None:
-        # Expecting queen, happy, go, italy
-        word_list = [ (['king', 'woman'],['man']), (['sad', 'good'],['bad']), 
-        (['walked', 'went'],['walk']), (['paris', 'rome'],['france']) ]
-    else:
-        word_list = [ (pos_words, neg_words) ]
-    for pos_words, neg_words in word_list:
-        pos_embed = [embed_mat[vocab[word]] for word in pos_words]
-        neg_embed = [embed_mat[vocab[word]] for word in neg_words]
-        pos_embed = xp.sum(xp.stack(pos_embed, axis=0), axis=0)
-        neg_embed = xp.sum(xp.stack(neg_embed, axis=0), axis=0)
-        forw = pos_embed - neg_embed
-        if return_vals:
-            nns, vals = get_vec_nn(model, forw, xp=xp, norm_embed=norm_embed, return_vals=True)
-            print(' '.join([nn + ' (' + str(val) + ')' for (nn,val) in list(zip(nns.split(' '), vals))]))
-        else:
-            print(get_vec_nn(model, forw, xp=xp, norm_embed=norm_embed))
-    print('\n')
-
-def example_nn(model, return_vals=False, xp=np):
-    '''
-    Nearest negihbor examples.
-    '''
-    vocab = model.vocab
-    unvocab = model.unvocab
-    embed_mat = model.bert.word_embeddings.W.data
-    norm_embed = utils.mat_normalize(embed_mat, xp=xp)
-    word_list = ['good', 'this', 'that', 'awesome', 'bad', 'wrong']
-    for word in word_list:
-        if return_vals:
-            nns, vals = get_vec_nn(model, word, xp=xp, norm_embed=norm_embed, return_vals=True)
-            exstr = ' '.join([nn + ' (' + str(val) + ')' for (nn,val) in list(zip(nns.split(' '), vals))])
-            print(word + ': ' + exstr)
-        else:
-            print(word + ': ' + get_vec_nn(model, word, xp=xp, norm_embed=norm_embed))
-    print('\n')
-
 def get_adv_example(model, emb, adv, inp):
     # Get embedding matrix
     embed_mat = model.bert.word_embeddings.W.data
@@ -685,10 +590,10 @@ def get_adv_example(model, emb, adv, inp):
 
     # Calculate L2 norms and cosine nearest neighbors...
     # ... for the original embeddings
-    emb_cos_nn = get_seq_nn(model, emb, norm_embed=norm_embed, xp=xp)
+    emb_cos_nn = utils.get_seq_nn(model, emb, norm_embed=norm_embed, xp=xp)
     emb_l2_norm = xp.linalg.norm(emb, axis=1).tolist()
     # ... for the adversarial embeddings
-    adv_cos_nn = get_seq_nn(model, adv, norm_embed=norm_embed, xp=xp)
+    adv_cos_nn = utils.get_seq_nn(model, adv, norm_embed=norm_embed, xp=xp)
     adv_l2_norm = xp.linalg.norm(adv, axis=1).tolist()
     # ... for the adversarial perturbations (also the L2-nns)
     per = adv-emb
@@ -698,7 +603,7 @@ def get_adv_example(model, emb, adv, inp):
         per_w = per[wi]
         org_w = emb[wi]
         rel_norm_embed = utils.mat_normalize(embed_mat - org_w, xp=xp)
-        nn_dir_w = get_vec_nn(model, per_w, k=1, norm_embed=rel_norm_embed, xp=xp)
+        nn_dir_w = utils.get_vec_nn(model, per_w, k=1, norm_embed=rel_norm_embed, xp=xp)
         per_cos_nn.append(nn_dir_w)
         per_l2_nn.append(utils.to_sent(utils.nn_vec_L2(embed_mat - org_w, per_w, k=1, return_vals=False, xp=xp), model.unvocab))
     per_cos_nn = ' '.join(per_cos_nn)
@@ -776,7 +681,8 @@ def get_adv_example(model, emb, adv, inp):
     data['cos_emb_adv'] = cos_emb_adv
     return data
 
-def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=None, token_budget=0.15, redundancy=True, max_step=50, xp=np):
+def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=None, 
+    token_budget=0.15, redundancy=True, max_step=50, verbose=False, xp=np):
     '''
     k-step FGSM on word embeddings, returns perturbed embedding variable.
     '''
@@ -816,7 +722,6 @@ def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=No
     step = 0
     token_budget = int(token_budget * input_ids.size)
     retval = None
-    verbose = False
 
     while True:
         for i in range(k):
@@ -863,7 +768,7 @@ def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=No
             adv_test_x = word_embed_lookup
 
             # Calculate cosine nearest neighbors
-            adv_cos_nn_ids = get_seq_nn(model, adv_test_x.data[0], norm_embed=norm_embed, get_ids=True, xp=xp)
+            adv_cos_nn_ids = utils.get_seq_nn(model, adv_test_x.data[0], norm_embed=norm_embed, get_ids=True, xp=xp)
             adv_cos_nn_ids = adv_cos_nn_ids[xp.newaxis,:]
 
             # Note the differences between original and adversarial-to-be input
@@ -1018,8 +923,7 @@ def main():
     # -------------------------------------------------------------------------------
 
     if FLAGS.do_resume:
-        # chainer.serializers.load_npz('./base_out_imdb/model_snapshot_iter_781.npz', model)
-        chainer.serializers.load_npz('./base_out_saved/model_snapshot_iter_2343.npz', model)        
+        chainer.serializers.load_npz('./base_models/model_snapshot_iter_2343_max_seq_length_256.npz', model)        
 
     if FLAGS.gpu >= 0:
         chainer.backends.cuda.get_device_from_id(FLAGS.gpu).use()
@@ -1069,9 +973,6 @@ def main():
         eval_examples = processor.get_test_examples(FLAGS.data_dir)
         test_iter = chainer.iterators.SerialIterator(eval_examples, FLAGS.train_batch_size * 2, repeat=False, shuffle=False)
 
-        # test_loss, test_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter)
-        # print('[test ] loss:{:.04f} acc:{:.04f}'.format(test_loss, test_acc))
-
         # test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
         #     adv_k=1, epsilon=FLAGS.adv_epsilon, adversarial=True)
         # print('[test  adv] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
@@ -1102,10 +1003,10 @@ def main():
         xp = model.bert.xp
 
         # print('Some example nearest neighbors:')
-        # example_nn(model, return_vals=True, xp=xp)
+        # utils.example_nn(model, return_vals=True, xp=xp)
         # print('Some example analogies:')
         # print("Given 'king + woman - man', 'sad + good - bad', 'walked + went - walk', 'paris + rome - france', expecting queen, happy, go, italy")
-        # analogy(model, pos_words=None, neg_words=None, return_vals=True, xp=xp)
+        # utils.analogy(model, pos_words=None, neg_words=None, return_vals=True, xp=xp)
 
         def adv_demo_iterate(model, eval_iter, epsilon, adv_k=1, max_examples=1, max_seq_len=50, prefix='', sparsity_keep=None, xp=np):
             
@@ -1192,7 +1093,7 @@ def main():
                             metadata['label'] = str(prediction_test[seq_idx]) + 'to' + str(prediction_adv_test[seq_idx])
                             metadata['name'] = FLAGS.output_dir + prefix + str(sequence_offset)
 
-                            create_adv_table(data, metadata, folder=FLAGS.output_dir, save_norms=True)
+                            visualize.create_adv_table(data, metadata, folder=FLAGS.output_dir, save_norms=True)
 
                             # Exit function if enough examples are created
                             if num_examples >= max_examples:
@@ -1219,7 +1120,7 @@ def main():
                     return None
 
             if proj:
-                adv_test_x_ids = proj_adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, sparsity_keep=sparsity_keep, xp=xp)
+                adv_test_x_ids = proj_adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, sparsity_keep=sparsity_keep, verbose=True, xp=xp)
 
                 # Check if an adversarial example is found
                 if adv_test_x_ids is None:
@@ -1295,7 +1196,7 @@ def main():
                     #     pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
                     #     pickle.dump(metadata, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
-                    create_adv_table(data, metadata, folder=FLAGS.output_dir, save_norms=True)
+                    visualize.create_adv_table(data, metadata, folder=FLAGS.output_dir, save_norms=True)
 
                 return True
 
@@ -1348,7 +1249,7 @@ def main():
                     print('eucnn_eucs: {}'.format(eucnn_eucs))
 
                 # Get k cosine nearest neighbors of the word
-                cosnn_words, cosnn_cosines = get_vec_nn(model, tok_idx, k=k, return_vals=True, norm_embed=None, xp=xp)
+                cosnn_words, cosnn_cosines = utils.get_vec_nn(model, tok_idx, k=k, return_vals=True, norm_embed=None, xp=xp)
                 cosnn_tok_ids = [model.vocab[x] for x in cosnn_words.split(' ')]
                 if verbose:
                     print('cosnn_words: {}'.format(cosnn_words))
@@ -1422,31 +1323,39 @@ def main():
             #     pickle.dump(eucnn_cosines, handle, protocol=pickle.HIGHEST_PROTOCOL)
             #     pickle.dump(cosnn_eucs, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
-            summary_histogram(cosnn_cosines, random_cosines, eucnn_cosines, folder=FLAGS.output_dir)
+            visualize.summary_histogram(cosnn_cosines, random_cosines, eucnn_cosines, folder=FLAGS.output_dir)
 
         def ugly_adv_iterator(model, eval_examples, xp=np):
-            emb_02_3_normal_counter = 0
-            proj_7_normal_counter = 0
+            emb_counter = 0
+            proj_counter = 0
             all_counter = 0
-            correct_pred_counter = 0
+            true_pred_counter = 0
 
-            for ex_index in range(200):
+            for ex_index in range(20000,20030):
+
                 all_counter += 1
-                emb_02_3_normal = adv_demo_by_index(model, eval_examples, ex_index, epsilon=0.2, adv_k=3, prefix='_normal', create_table=True, proj=False, xp=xp)
-                if emb_02_3_normal is not None:
-                    proj_7_normal = adv_demo_by_index(model, eval_examples, ex_index, epsilon=7.0, adv_k=1, prefix='_normal', create_table=True, xp=xp)
-                    correct_pred_counter += 1
-                    if emb_02_3_normal:
-                        emb_02_3_normal_counter += 1
-                    if proj_7_normal:
-                        proj_7_normal_counter += 1
+                emb = adv_demo_by_index(model, eval_examples, ex_index, 
+                    epsilon=0.2, adv_k=3, prefix='_025sparse', create_table=True, sparsity_keep=0.25, proj=False, xp=xp)
+                proj = False
 
-            print('emb_02_3_normal_counter: {}'.format(emb_02_3_normal_counter))
-            print('proj_7_normal_counter: {}'.format(proj_7_normal_counter))
+                if emb is not None:
+                    for epsilon in [3.0,5.0,7.0,10.0]:
+                        proj = proj or adv_demo_by_index(model, eval_examples, ex_index, 
+                            epsilon=7.0, adv_k=1, prefix='_025sparse', create_table=True, sparsity_keep=0.25, xp=xp)
+
+                    true_pred_counter += 1
+                    if emb:
+                        emb_counter += 1
+                    if proj:
+                        proj_counter += 1
+
+            print('emb_counter: {}'.format(emb_counter))
+            print('proj_counter: {}'.format(proj_counter))
             print('all_counter: {}'.format(all_counter))
-            print('correct_pred_counter: {}'.format(correct_pred_counter))
+            print('true_pred_counter: {}'.format(true_pred_counter))
 
-        ugly_adv_iterator(model, eval_examples, xp=xp)
+        # ugly_adv_iterator(model, eval_examples, xp=xp)
+        adv_demo_by_index(model, eval_examples, 58, epsilon=10.0, adv_k=1, prefix='_sparse', sparsity_keep=0.25, create_table=True, xp=xp)
 
 if __name__ == "__main__":
     main()

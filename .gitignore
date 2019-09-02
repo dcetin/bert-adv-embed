@@ -1,6 +1,6 @@
 glue_data/
 uncased*
 aclImdb
-base_out*/
+base_*/
 out_*/
 __pycache__/
