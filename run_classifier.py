@@ -1599,35 +1599,7 @@ def main():
 
         # adv_demo_by_index(model, eval_examples, 58, epsilon=0.6, adv_k=1, prefix='_normal', sparsity_keep=None, proj=False, create_table=True, xp=xp)
         # summary_statistics(model, eval_examples, verbose=False, xp=xp)
-            
-        # Set the iterators
-        adv_k = 1
-        epsilon = 0.6
-        sparsity_keep = None
-        batch_size = FLAGS.train_batch_size * 2
-        train_examples = processor.get_train_examples(FLAGS.data_dir)
-        test_examples = processor.get_test_examples(FLAGS.data_dir)
-        train_iter = chainer.iterators.SerialIterator(train_examples, batch_size, repeat=False, shuffle=False)
-        test_iter = chainer.iterators.SerialIterator(test_examples, batch_size, repeat=False, shuffle=False)
 
-        # Collect embeddings and outputs on training data
-        train_outputs = []
-        train_adv_outputs = []
-        # train_embeds = []
-        # train_adv_embeds = []
-        for train_batch in train_iter:
-            data = model.converter(train_batch, FLAGS.gpu)
-            input_ids, input_mask, segment_ids, label_id = data
-            adv_train_x = adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, sparsity_keep=sparsity_keep, xp=xp)
-            with chainer.using_config('train', False):
-                pooled_out = model.bert.get_pooled_output(input_ids, input_mask, segment_ids).data
-                train_outputs.append(xp.asnumpy(pooled_out))
-                # embed_lookup = model.bert.word_embed_lookup.data
-                # embed_lookup = embed_lookup.reshape(-1, embed_lookup.shape[-1])
-                # train_embeds.append(xp.asnumpy(embed_lookup))
-                # train_adv_embeds.append(xp.asnumpy(adv_train_x.data.reshape(-1, embed_lookup.shape[-1])))
-                pooled_adv_out = model.bert(input_ids, input_mask, segment_ids, feed_word_embeddings=True, input_word_embeddings=adv_train_x).data
-                train_adv_outputs.append(xp.asnumpy(pooled_adv_out))
 
 if __name__ == "__main__":
     main()
