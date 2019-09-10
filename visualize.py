@@ -59,7 +59,7 @@ def create_adv_table(data, metadata, folder='temp', save_norms=True):
     adv_table_helper(df, annot_nn, md, data, folder)
     adv_table_helper(df, annot_nn, md, data, folder, save_norms)
 
-def summary_histogram(measure, cosnn_meas, random_meas, eucnn_meas, density=True, folder='temp', suffix=''):
+def summary_histogram(measure, cosnn_meas, random_meas, eucnn_meas, per_meas, density=True, folder='temp', suffix=''):
 
     if suffix != '':
         suffix = '_' + str(suffix)
@@ -69,32 +69,42 @@ def summary_histogram(measure, cosnn_meas, random_meas, eucnn_meas, density=True
         meas_xlabel = 'Cosine similarity'
 
     elif measure is 'euclidean':
-        bare_max = np.max([np.max(random_eucs), np.max(eucnn_eucs[:, 1:]), np.max(cosnn_eucs[:, 1:])])
+        bare_max = np.max([np.max(random_meas), np.max(eucnn_meas[:, 1:]), np.max(cosnn_meas[:, 1:])])
         set_max = np.round(bare_max * 1.01, 2)
         step = set_max / 50
         meas_bins = np.arange(0.0, set_max + step, step)
         meas_xlabel = 'Euclidean (L2) distance'
 
-    cosnn_meas_org = cosnn_meas[:,:]
     random_meas = random_meas.flatten()
+    per_meas = per_meas.flatten()
     cosnn_meas = cosnn_meas[:, 1:].flatten()
     eucnn_meas = eucnn_meas[:, 1:].flatten()
 
+    print(meas_xlabel)
+    for (lab,arr) in (('Random', random_meas), ('Perturbation', per_meas),('Cosine-nn', cosnn_meas), ('L2-nn', eucnn_meas)):
+        print(lab, np.min(arr), np.mean(arr), np.max(arr))
+    print(' ')
+
     random_counts, bins = np.histogram(random_meas, meas_bins)
+    per_counts, bins = np.histogram(per_meas, meas_bins)
     cosnn_counts, bins = np.histogram(cosnn_meas, meas_bins)
     eucnn_counts, bins = np.histogram(eucnn_meas, meas_bins)
     if density:
         random_counts = random_counts / random_meas.size
+        per_counts = per_counts / per_meas.size
         cosnn_counts = cosnn_counts / cosnn_meas.size
         eucnn_counts = eucnn_counts / eucnn_meas.size
 
+    # ymax = np.max([np.max(random_counts), np.max(cosnn_counts), np.max(eucnn_counts), np.max(per_counts)])
     ymax = np.max([np.max(random_counts), np.max(cosnn_counts), np.max(eucnn_counts)])
 
+    plt.figure(figsize=(8,6))
     plt.hist(meas_bins[:-1], meas_bins, weights=random_counts, facecolor='r', alpha=0.50)
     plt.hist(meas_bins[:-1], meas_bins, weights=cosnn_counts, facecolor='g', alpha=0.50)
     plt.hist(meas_bins[:-1], meas_bins, weights=eucnn_counts, facecolor='b', alpha=0.50)
-    handles = [Rectangle((0,0), 1, 1, color=c, ec='k') for c in ['r', 'g', 'b']]
-    labels = ['random', 'cosnn', 'eucnn']
+    plt.hist(meas_bins[:-1], meas_bins, weights=per_counts, facecolor='y', alpha=0.50)
+    handles = [Rectangle((0,0), 1, 1, color=c, ec='k') for c in ['r', 'g', 'b', 'y']]
+    labels = ['random', 'cosnn', 'eucnn', 'per']
     plt.legend(handles, labels)
     plt.xlabel(meas_xlabel)
     plt.ylabel('Probability')
@@ -104,11 +114,12 @@ def summary_histogram(measure, cosnn_meas, random_meas, eucnn_meas, density=True
     plt.savefig(os.path.join(folder, measure + str(suffix) + '.png'), bbox_inches='tight')
     plt.clf()
 
-    plot_array = [
-                ('Random sampling', 'random', random_counts, 'r'),
-                ('Cosine nearest neighbors', 'cosnn', cosnn_counts, 'g'),
-                ('Euclidean nearest neighbors', 'eucnn', eucnn_counts, 'b')]
-    for (title, name, data, color) in plot_array:
+    plot_array = [('Random sampling', 'random', random_counts, 'r'),
+                  ('Cosine nearest neighbors', 'cosnn', cosnn_counts, 'g'),
+                  ('Euclidean nearest neighbors', 'eucnn', eucnn_counts, 'b'),
+                  ('Adversarial perturbation', 'per', per_counts, 'y')]
+    for (i,(title, name, data, color)) in enumerate(plot_array):
+        plt.figure(figsize=(8,6))
         plt.hist(meas_bins[:-1], meas_bins, weights=data, facecolor=color)
         plt.xlabel(meas_xlabel)
         plt.ylabel('Probability')
@@ -117,6 +128,50 @@ def summary_histogram(measure, cosnn_meas, random_meas, eucnn_meas, density=True
         plt.ylim((0, ymax * 1.02))
         plt.savefig(os.path.join(folder, measure + '_' + name + str(suffix) + '.png'), bbox_inches='tight')
         plt.clf()
+
+    plt.figure(figsize=(16,4))
+    plot_array = [('Random', 'random', random_counts, 'r'),
+                  ('Cosine-nn', 'cosnn', cosnn_counts, 'g'),
+                  ('L2-nn', 'eucnn', eucnn_counts, 'b'),
+                  ('Adv', 'per', per_counts, 'y')]
+    for (i,(title, name, data, color)) in enumerate(plot_array):
+        plt.subplot(141+i)
+        plt.hist(meas_bins[:-1], meas_bins, weights=data, facecolor=color)
+        plt.xlabel(meas_xlabel)
+        if i == 0:
+            plt.ylabel('Probability')
+        plt.title(title)
+        plt.grid(True)
+        plt.ylim((0, ymax * 1.02))
+    plt.savefig(os.path.join(folder, measure + '_all' + str(suffix) + '.png'), bbox_inches='tight')
+    plt.clf()
+
+def PCA_score_plot(train_scores, train_adv_scores, test_scores, test_adv_scores, data_src, folder='temp'):
+    
+    plt.plot(np.log(train_scores), 'r-', linewidth=1)
+    plt.plot(np.log(train_adv_scores), 'g-', linewidth=1)
+    plt.plot(np.log(test_scores), 'b-', linewidth=1)
+    plt.plot(np.log(test_adv_scores), 'y-', linewidth=1)
+    labels = ['Train', 'Adv. Train', 'Test', 'Adv. Test']
+    plt.legend(labels)
+    plt.xlabel('Component Number')
+    plt.ylabel('Mean Absolute Value (log scale)')
+    plt.title('PCA scores for ' + data_src)
+    plt.savefig(os.path.join(folder, 'pca_' + data_src +'.png'), bbox_inches='tight')
+    plt.clf()
+
+    plt.figure(figsize=(16,4))
+    plot_array = [(train_scores, 'r-', 'Train'), (train_adv_scores, 'g-', 'Adv. Train'), 
+                  (test_scores, 'b-', 'Test'), (test_adv_scores, 'y-', 'Adv. Test')]
+    for (i,(scores, fmt, title)) in enumerate(plot_array):
+        plt.subplot(141+i)
+        plt.plot(np.log(scores), fmt, linewidth=1)
+        plt.xlabel('Component Number')
+        if i == 0:
+            plt.ylabel('Mean Absolute Value (log scale)')
+        plt.title(title)
+    plt.savefig(os.path.join(folder, 'pca_' + data_src + '_all.png'), bbox_inches='tight')
+    plt.clf()
 
 if __name__ == "__main__":
 
@@ -135,6 +190,8 @@ if __name__ == "__main__":
         eucnn_eucs = pickle.load(handle)
         eucnn_cosines = pickle.load(handle)
         cosnn_eucs = pickle.load(handle)
+        per_cosine = pickle.load(handle)
+        per_euc = pickle.load(handle)
 
-    summary_histogram('cosine', cosnn_cosines, random_cosines, eucnn_cosines, density=True, folder='out_imdb')
-    summary_histogram('euclidean', cosnn_eucs, random_eucs, eucnn_eucs, density=True, folder='out_imdb')
+    summary_histogram('cosine', cosnn_cosines, random_cosines, eucnn_cosines, per_cosine, density=True, folder='out_imdb')
+    summary_histogram('euclidean', cosnn_eucs, random_eucs, eucnn_eucs, per_euc, density=True, folder='out_imdb')

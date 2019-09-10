@@ -127,7 +127,7 @@ def cosine_vec(vec1, vec2, epsilon=1e-12, xp=np):
     """
     vec1 = vec_normalize(vec1, epsilon=epsilon, xp=xp)
     vec2 = vec_normalize(vec2, epsilon=epsilon, xp=xp)
-    cos = xp.clip(xp.dot(vec1 * vec2), 0.0, 1.0)
+    cos = xp.clip(xp.dot(vec1, vec2), 0.0, 1.0)
     return cos
 
 def cosine_seq(seq1, seq2, epsilon=1e-12, xp=np):

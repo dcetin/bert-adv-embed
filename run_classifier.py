@@ -473,9 +473,22 @@ def _truncate_seq_pair(tokens_a, tokens_b, max_length):
 # New functions
 
 def adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=None, xp=np):
-    '''
-    k-step FGSM on word embeddings, returns perturbed embedding variable.
-    '''
+    """
+    k-step FGSM on word embeddings.
+
+    Args:
+        model: Neural network model.
+        data: Output tuple of the converter.
+        epsilon: Norm coefficient of the perturbation.
+        k: Number of successive perturbation steps.
+        train: If False, disables dropout, for evaluation purposes.
+        sparsity_keep: Ratio of highest L2 norm perturbations to be kept.
+        xp: Matrix library, np for numpy and cp for cupy.
+
+    Returns:
+        Perturbed embedding variable.
+    """
+
     # Cannot seem to backprop on eval mode, so this seems like a possible workaround
     # -------------------------------------------------------------------------------
     org_dropout = (model.output_dropout, 
@@ -547,7 +560,21 @@ def adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=None, x
     return word_embed_lookup
 
 def evaluate_fn(eval_iter, device, model, converter, adversarial=False, sparsity_keep=None, adv_k=1, epsilon=0.6):
+    """
     
+
+    Args:
+        eval_iter: 
+        model: Neural network model.
+        epsilon: Norm coefficient of the perturbation.
+        k: Number of successive perturbation steps.
+        train: If False, disables dropout, for evaluation purposes.
+        sparsity_keep: Ratio of highest L2 norm perturbations to be kept.
+        xp: Matrix library, np for numpy and cp for cupy.
+
+    Returns:
+        
+    """    
     xp = model.bert.xp
     eval_losses = []
     eval_accuracies = []
@@ -860,6 +887,260 @@ def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=No
             print('Adversarial text found with {} changes (<{}).\n'.format(len(diff_ids), token_budget))
     return retval
 
+def adv_demo_by_index(model, eval_examples, sequence_offset, epsilon, adv_k=1, prefix='', 
+    sparsity_keep=None, proj=True, create_table=False, early_return=True, return_data=False, xp=np):
+
+    retval = True
+
+    with chainer.using_config('train', False):
+        data = model.converter([eval_examples[sequence_offset]], FLAGS.gpu)
+        input_ids, input_mask, segment_ids, label_id = data
+
+        # Prediction on original data
+        pred_logits = model(input_ids, input_mask, segment_ids, label_id, return_logits=True)
+        prediction_test = xp.argmax(pred_logits.data, axis=1)
+        std = (prediction_test == label_id)
+
+        # Check if the original prediction is correct or wrong
+        if not std[0]:
+            if early_return:
+                return None
+            else:
+                retval = None
+
+    if proj:
+        adv_test_x_ids = proj_adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, sparsity_keep=sparsity_keep, verbose=True, xp=xp)
+
+        # Check if an adversarial example is found
+        if adv_test_x_ids is None:
+            if early_return:
+                return False
+            else:
+                retval = False
+    else:
+        adv_test_x_embed = adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, sparsity_keep=sparsity_keep, xp=xp)
+
+    with chainer.using_config('train', False):
+
+        # Prediction on adversarial data
+        if proj:
+            # ...using adversarial text
+            pred_logits = model(adv_test_x_ids, input_mask, segment_ids, label_id, return_logits=True)
+            prediction_adv_test = xp.argmax(pred_logits.data, axis=1)
+        else:
+            # ...using adversarial embeddings
+            pooled_out = model.bert(input_ids, input_mask, segment_ids, 
+                feed_word_embeddings=True, input_word_embeddings=adv_test_x_embed)
+            pred_logits = model.get_logits_from_output(pooled_out)
+            prediction_adv_test = xp.argmax(pred_logits.data, axis=1)
+
+        # Compare predictions and get the indices of the adversarial examples
+        adv = (prediction_adv_test == label_id)
+        res = ~adv & std
+        res_ids = xp.where(res.astype(int) == 1)[0].tolist()
+
+        if not res[0]:
+            if early_return:
+                return False
+            else:
+                retval = False
+
+        if create_table:
+            # Save the embedding arrays
+            embed_x = model.bert.get_word_embeddings(input_ids, input_mask, segment_ids)
+            embed_x = embed_x.data
+            
+            # Get adversarial embeddings if using adversarial text as input
+            if proj:
+                adv_test_x = model.bert.get_word_embeddings(adv_test_x_ids, input_mask, segment_ids)
+            else:
+                adv_test_x = adv_test_x_embed
+            adv_test_x = adv_test_x.data
+
+            # Print indices and accuracies over the current batch
+            print('groundtruth: {}'.format(label_id))
+            print('predictions: {}'.format(prediction_test))
+            print('adv.  preds: {}'.format(prediction_adv_test))
+
+            # Only one example
+            seq_idx = 0
+
+            # Print sequence metadata
+            seqlen = int(sum(input_mask[seq_idx].tolist()))
+            print('seq_offset: {} of length {}'.format(sequence_offset, seqlen))
+
+            # Get the matrices
+            emb = embed_x[seq_idx]
+            adv = adv_test_x[seq_idx]
+            inp = input_ids[seq_idx]
+
+            # Crop the sequences to avoid printing the padding
+            emb = emb[:seqlen]
+            adv = adv[:seqlen]
+            inp = input_ids[:seqlen]
+
+            data = get_adv_example(model, emb, adv, inp)
+            metadata = {}
+            metadata['epsilon'] = str(epsilon)
+            metadata['adv_k'] = str(adv_k)
+            metadata['label'] = str(prediction_test[seq_idx]) + 'to' + str(prediction_adv_test[seq_idx])
+            metadata['name'] = FLAGS.output_dir + prefix + str(sequence_offset)
+
+            # pik_file = 'example_adv_data.pickle'
+            # with open(os.path.join('./', pik_file), 'wb') as handle:
+            #     pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            #     pickle.dump(metadata, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+            visualize.create_adv_table(data, metadata, folder=FLAGS.output_dir, save_norms=True)
+
+        if return_data:
+            return retval, data
+        else:
+            return retval
+
+def summary_statistics(model, eval_examples, verbose=False, xp=np):
+
+    k = 6
+    m = 5
+    n = 10000
+
+    cosnn_cosines_list = []
+    random_cosines_list = []
+    random_eucs_list = []
+    eucnn_eucs_list = []
+    eucnn_cosines_list = []
+    cosnn_eucs_list = []
+    per_cosine_list = []
+    per_euc_list = []
+
+    dataset_len = len(eval_examples)
+    embed_mat = model.bert.word_embeddings.W.data
+    norm_embed = utils.mat_normalize(embed_mat, xp=xp)
+    eval_examples_array = np.array(eval_examples)
+    if verbose:
+        print('dataset_len: {}'.format(dataset_len))
+
+    counter = 0
+
+    for i in range(n):
+
+        # Pick a random sequence
+        seq_idx = np.random.randint(dataset_len, size=1)[0]
+        data = model.converter([eval_examples[seq_idx]], FLAGS.gpu)
+        input_ids, input_mask, segment_ids, label_id = data
+        if verbose:
+            print('seq_idx: {}'.format(seq_idx))
+
+        # Pick a random token from that sequence
+        seqlen = int(sum(input_mask[0].tolist()))
+        tok_offset = np.random.randint(seqlen, size=1)[0]
+        tok_idx = input_ids[0, tok_offset].tolist()
+        tok_word = model.unvocab[tok_idx]
+        if verbose:
+            print('tok_offset: {}'.format(tok_offset))
+            print('tok_idx: {}'.format(tok_idx))
+            print('tok_word: {}'.format(tok_word))
+
+        # Get k Euclidean nearest neighbors of the word
+        eucnn_tok_ids, eucnn_eucs = utils.nn_vec_L2(embed_mat, embed_mat[tok_idx], k=k, return_vals=True, xp=xp)
+        eucnn_words = [model.unvocab[w] for w in eucnn_tok_ids.tolist()]
+        if verbose:
+            print('eucnn_words: {}'.format(eucnn_words))
+            print('eucnn_eucs: {}'.format(eucnn_eucs))
+
+        # Get k cosine nearest neighbors of the word
+        cosnn_words, cosnn_cosines = utils.get_vec_nn(model, tok_idx, k=k, return_vals=True, norm_embed=None, xp=xp)
+        cosnn_tok_ids = [model.vocab[x] for x in cosnn_words.split(' ')]
+        if verbose:
+            print('cosnn_words: {}'.format(cosnn_words))
+            print('cosnn_cosines: {}'.format(cosnn_cosines))
+
+        # Calculate the Euclidean distances w.r.t. cosine nearest neighbors
+        cosnn_eucs = xp.linalg.norm(embed_mat[cosnn_tok_ids] - embed_mat[tok_idx], axis=1)
+        if verbose:
+            print('cosnn_eucs: {}'.format(cosnn_eucs))
+
+        # Calculate the cosine similarities w.r.t. Euclidean nearest neighbors
+        eucnn_cosines = xp.matmul(norm_embed[eucnn_tok_ids], norm_embed[tok_idx])
+        if verbose:
+            print('eucnn_cosines: {}'.format(eucnn_cosines))
+
+        # Calculate the cosine similarity and Euclidean distance of th
+        adv = adv_FGSM_k(model, data, k=1, epsilon=0.6, train=False, sparsity_keep=None, xp=xp).data[0]
+        per_cosine = utils.cosine_vec(adv[tok_offset], embed_mat[tok_idx], xp=xp)
+        per_euc = xp.linalg.norm(adv[tok_offset] - embed_mat[tok_idx])
+        if verbose:
+            print('per_cosine: {}'.format(per_cosine))
+            print('per_euc: {}'.format(per_euc))
+
+        # Pick m random sequences
+        seq_ids = np.random.randint(dataset_len, size=m)
+        pls = eval_examples_array[seq_ids]
+        data_rand = model.converter(pls, FLAGS.gpu)
+        input_ids, input_mask, segment_ids, label_id = data_rand
+        if verbose:
+            print('seq_ids: {}'.format(seq_ids))
+
+        # Pick a random token from each of those sequences
+        seqlens = xp.sum(input_mask, axis=1).astype(int).tolist()
+        rand_tok_offsets = [np.random.randint(seqlen, size=1)[0] for seqlen in seqlens]
+        rand_tok_ids = [input_ids[i, tok_offset].tolist() for (i,tok_offset) in enumerate(rand_tok_offsets)]
+        rand_tok_words = [model.unvocab[rti] for rti in rand_tok_ids]
+        rand_tok_ids = xp.array(rand_tok_ids)
+        if verbose:
+            print('rand_tok_offsets: {}'.format(rand_tok_offsets))
+            print('rand_tok_ids: {}'.format(rand_tok_ids))
+            print('rand_tok_words: {}'.format(rand_tok_words))
+
+        # Calculate cosine similarity w.r.t. each sampled token
+        random_cosines = xp.matmul(norm_embed[rand_tok_ids], norm_embed[tok_idx])
+        if verbose:
+            print('random_cosines: {}'.format(random_cosines))
+
+        # Calculate Euclidean distance w.r.t. each sampled token
+        random_eucs = xp.linalg.norm(embed_mat[rand_tok_ids] - embed_mat[tok_idx], axis=1)
+        if verbose:
+            print('random_eucs: {}'.format(random_eucs))
+
+        # Append new entries to respective lists
+        random_cosines_list.append(xp.array(random_cosines))
+        random_eucs_list.append(xp.array(random_eucs))
+        cosnn_cosines_list.append(xp.array(cosnn_cosines))
+        eucnn_eucs_list.append(xp.array(eucnn_eucs))
+        eucnn_cosines_list.append(xp.array(eucnn_cosines))
+        cosnn_eucs_list.append(xp.array(cosnn_eucs))
+        per_cosine_list.append(xp.array(per_cosine))
+        per_euc_list.append(xp.array(per_euc))
+
+        if verbose:
+            print(' ')
+
+        counter += 1
+
+    random_cosines = xp.asnumpy(xp.stack(random_cosines_list))
+    random_eucs = xp.asnumpy(xp.stack(random_eucs_list))
+    cosnn_cosines = xp.asnumpy(xp.stack(cosnn_cosines_list))
+    eucnn_eucs = xp.asnumpy(xp.stack(eucnn_eucs_list))
+    eucnn_cosines = xp.asnumpy(xp.stack(eucnn_cosines_list))
+    cosnn_eucs = xp.asnumpy(xp.stack(cosnn_eucs_list))
+    per_cosine = xp.asnumpy(xp.stack(per_cosine_list))
+    per_euc = xp.asnumpy(xp.stack(per_euc_list))
+
+    pik_file = 'summary_data_10000_5_5.pickle'
+    with open(os.path.join('./', pik_file), 'wb') as handle:
+        pickle.dump(random_cosines, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(random_eucs, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(cosnn_cosines, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(eucnn_eucs, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(eucnn_cosines, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(cosnn_eucs, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(per_cosine, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(per_euc, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    visualize.summary_histogram('cosine', cosnn_cosines, random_cosines, eucnn_cosines, per_cosine, density=True, folder=FLAGS.output_dir)
+    visualize.summary_histogram('euclidean', cosnn_eucs, random_eucs, eucnn_eucs, per_euc, density=True, folder=FLAGS.output_dir)
+
+
 
 def main():
     processors = {
@@ -923,7 +1204,9 @@ def main():
     # -------------------------------------------------------------------------------
 
     if FLAGS.do_resume:
-        chainer.serializers.load_npz('./base_models/model_snapshot_iter_2343_max_seq_length_256.npz', model)        
+        chainer.serializers.load_npz('./base_models/model_snapshot_iter_2343_max_seq_length_128.npz', model)
+        # chainer.serializers.load_npz('./base_models/model_snapshot_iter_2343_max_seq_length_256.npz', model)
+        # chainer.serializers.load_npz('./base_models/model_snapshot_iter_4687_max_seq_length_512.npz', model)
 
     if FLAGS.gpu >= 0:
         chainer.backends.cuda.get_device_from_id(FLAGS.gpu).use()
@@ -977,20 +1260,20 @@ def main():
         #     adv_k=1, epsilon=FLAGS.adv_epsilon, adversarial=True)
         # print('[test  adv] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
 
-        test_loss, test_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter)
-        print('[test ] loss:{:.04f} acc:{:.04f}'.format(test_loss, test_acc))
+        # test_loss, test_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter)
+        # print('[test ] loss:{:.04f} acc:{:.04f}'.format(test_loss, test_acc))
 
-        test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
-            adv_k=1, epsilon=0.6, adversarial=True)
-        print('[test 1x0.6] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
+        # test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
+        #     adv_k=1, epsilon=0.6, adversarial=True)
+        # print('[test 1x0.6] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
 
-        test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
-            adv_k=1, epsilon=0.6, adversarial=True, sparsity_keep=0.25)
-        print('[test 1x0.6[0.25]] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
+        # test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
+        #     adv_k=1, epsilon=0.6, adversarial=True, sparsity_keep=0.25)
+        # print('[test 1x0.6[0.25]] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
 
-        test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
-            adv_k=3, epsilon=0.2, adversarial=True)
-        print('[test 3x0.2] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
+        # test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
+        #     adv_k=3, epsilon=0.2, adversarial=True)
+        # print('[test 3x0.2] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
 
         test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
             adv_k=3, epsilon=0.2, adversarial=True, sparsity_keep=0.25)
@@ -999,7 +1282,7 @@ def main():
     if FLAGS.do_experiment:
 
         eval_examples = processor.get_test_examples(FLAGS.data_dir)
-        test_iter = chainer.iterators.SerialIterator(eval_examples, FLAGS.train_batch_size * 2, repeat=False, shuffle=False)
+        test_iter = chainer.iterators.SerialIterator(eval_examples, FLAGS.train_batch_size, repeat=False, shuffle=False)
         xp = model.bert.xp
 
         # print('Some example nearest neighbors:')
@@ -1104,227 +1387,6 @@ def main():
             eval_iter.reset()
             return
 
-        def adv_demo_by_index(model, eval_examples, sequence_offset, epsilon, adv_k=1, prefix='', sparsity_keep=None, proj=True, create_table=False, xp=np):
-
-            with chainer.using_config('train', False):
-                data = model.converter([eval_examples[sequence_offset]], FLAGS.gpu)
-                input_ids, input_mask, segment_ids, label_id = data
-
-                # Prediction on original data
-                pred_logits = model(input_ids, input_mask, segment_ids, label_id, return_logits=True)
-                prediction_test = xp.argmax(pred_logits.data, axis=1)
-                std = (prediction_test == label_id)
-
-                # Check if the original prediction is correct or wrong
-                if not std[0]:
-                    return None
-
-            if proj:
-                adv_test_x_ids = proj_adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, sparsity_keep=sparsity_keep, verbose=True, xp=xp)
-
-                # Check if an adversarial example is found
-                if adv_test_x_ids is None:
-                    return False
-            else:
-                adv_test_x_embed = adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, sparsity_keep=sparsity_keep, xp=xp)
-
-            with chainer.using_config('train', False):
-
-                # Prediction on adversarial data
-                if proj:
-                    # ...using adversarial text
-                    pred_logits = model(adv_test_x_ids, input_mask, segment_ids, label_id, return_logits=True)
-                    prediction_adv_test = xp.argmax(pred_logits.data, axis=1)
-                else:
-                    # ...using adversarial embeddings
-                    pooled_out = model.bert(input_ids, input_mask, segment_ids, 
-                        feed_word_embeddings=True, input_word_embeddings=adv_test_x_embed)
-                    pred_logits = model.get_logits_from_output(pooled_out)
-                    prediction_adv_test = xp.argmax(pred_logits.data, axis=1)
-
-                # Compare predictions and get the indices of the adversarial examples
-                adv = (prediction_adv_test == label_id)
-                res = ~adv & std
-                res_ids = xp.where(res.astype(int) == 1)[0].tolist()
-
-                if not res[0]:
-                    return False
-
-                if create_table:
-                    # Save the embedding arrays
-                    embed_x = model.bert.get_word_embeddings(input_ids, input_mask, segment_ids)
-                    embed_x = embed_x.data
-                    
-                    # Get adversarial embeddings if using adversarial text as input
-                    if proj:
-                        adv_test_x = model.bert.get_word_embeddings(adv_test_x_ids, input_mask, segment_ids)
-                    else:
-                        adv_test_x = adv_test_x_embed
-                    adv_test_x = adv_test_x.data
-
-                    # Print indices and accuracies over the current batch
-                    print('groundtruth: {}'.format(label_id))
-                    print('predictions: {}'.format(prediction_test))
-                    print('adv.  preds: {}'.format(prediction_adv_test))
-
-                    # Only one example
-                    seq_idx = 0
-
-                    # Print sequence metadata
-                    seqlen = int(sum(input_mask[seq_idx].tolist()))
-                    print('seq_offset: {} of length {}'.format(sequence_offset, seqlen))
-
-                    # Get the matrices
-                    emb = embed_x[seq_idx]
-                    adv = adv_test_x[seq_idx]
-                    inp = input_ids[seq_idx]
-
-                    # Crop the sequences to avoid printing the padding
-                    emb = emb[:seqlen]
-                    adv = adv[:seqlen]
-                    inp = input_ids[:seqlen]
-
-                    data = get_adv_example(model, emb, adv, inp)
-                    metadata = {}
-                    metadata['epsilon'] = str(epsilon)
-                    metadata['adv_k'] = str(adv_k)
-                    metadata['label'] = str(prediction_test[seq_idx]) + 'to' + str(prediction_adv_test[seq_idx])
-                    metadata['name'] = FLAGS.output_dir + prefix + str(sequence_offset)
-
-                    # pik_file = 'example_adv_data.pickle'
-                    # with open(os.path.join('./', pik_file), 'wb') as handle:
-                    #     pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
-                    #     pickle.dump(metadata, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
-                    visualize.create_adv_table(data, metadata, folder=FLAGS.output_dir, save_norms=True)
-
-                return True
-
-        def summary_statistics(model, eval_examples, verbose=False, xp=np):
-
-            k = 6
-            m = 5
-            n = 10000
-
-            cosnn_cosines_list = []
-            random_cosines_list = []
-            random_eucs_list = []
-            eucnn_eucs_list = []
-            eucnn_cosines_list = []
-            cosnn_eucs_list = []
-
-            dataset_len = len(eval_examples)
-            embed_mat = model.bert.word_embeddings.W.data
-            norm_embed = utils.mat_normalize(embed_mat, xp=xp)
-            eval_examples_array = np.array(eval_examples)
-            if verbose:
-                print('dataset_len: {}'.format(dataset_len))
-
-            counter = 0
-
-            for i in range(n):
-
-                # Pick a random sequence
-                seq_idx = np.random.randint(dataset_len, size=1)[0]
-                data = model.converter([eval_examples[seq_idx]], FLAGS.gpu)
-                input_ids, input_mask, segment_ids, label_id = data
-                if verbose:
-                    print('seq_idx: {}'.format(seq_idx))
-
-                # Pick a random token from that sequence
-                seqlen = int(sum(input_mask[0].tolist()))
-                tok_offset = np.random.randint(seqlen, size=1)[0]
-                tok_idx = input_ids[0, tok_offset].tolist()
-                tok_word = model.unvocab[tok_idx]
-                if verbose:
-                    print('tok_offset: {}'.format(tok_offset))
-                    print('tok_idx: {}'.format(tok_idx))
-                    print('tok_word: {}'.format(tok_word))
-
-                # Get k Euclidean nearest neighbors of the word
-                eucnn_tok_ids, eucnn_eucs = utils.nn_vec_L2(embed_mat, embed_mat[tok_idx], k=k, return_vals=True, xp=xp)
-                eucnn_words = [model.unvocab[w] for w in eucnn_tok_ids.tolist()]
-                if verbose:
-                    print('eucnn_words: {}'.format(eucnn_words))
-                    print('eucnn_eucs: {}'.format(eucnn_eucs))
-
-                # Get k cosine nearest neighbors of the word
-                cosnn_words, cosnn_cosines = utils.get_vec_nn(model, tok_idx, k=k, return_vals=True, norm_embed=None, xp=xp)
-                cosnn_tok_ids = [model.vocab[x] for x in cosnn_words.split(' ')]
-                if verbose:
-                    print('cosnn_words: {}'.format(cosnn_words))
-                    print('cosnn_cosines: {}'.format(cosnn_cosines))
-
-                # Calculate the Euclidean distances w.r.t. cosine nearest neighbors
-                cosnn_eucs = xp.linalg.norm(embed_mat[cosnn_tok_ids] - embed_mat[tok_idx], axis=1)
-                if verbose:
-                    print('cosnn_eucs: {}'.format(cosnn_eucs))
-
-                # Calculate the cosine similarities w.r.t. Euclidean nearest neighbors
-                eucnn_cosines = xp.matmul(norm_embed[eucnn_tok_ids], norm_embed[tok_idx])
-                if verbose:
-                    print('eucnn_cosines: {}'.format(eucnn_cosines))
-
-                # Pick m random sequences
-                seq_ids = np.random.randint(dataset_len, size=m)
-                pls = eval_examples_array[seq_ids]
-                data = model.converter(pls, FLAGS.gpu)
-                input_ids, input_mask, segment_ids, label_id = data
-                if verbose:
-                    print('seq_ids: {}'.format(seq_ids))
-
-                # Pick a random token from each of those sequences
-                seqlens = xp.sum(input_mask, axis=1).astype(int).tolist()
-                rand_tok_offsets = [np.random.randint(seqlen, size=1)[0] for seqlen in seqlens]
-                rand_tok_ids = [input_ids[i, tok_offset].tolist() for (i,tok_offset) in enumerate(rand_tok_offsets)]
-                rand_tok_words = [model.unvocab[rti] for rti in rand_tok_ids]
-                rand_tok_ids = xp.array(rand_tok_ids)
-                if verbose:
-                    print('rand_tok_offsets: {}'.format(rand_tok_offsets))
-                    print('rand_tok_ids: {}'.format(rand_tok_ids))
-                    print('rand_tok_words: {}'.format(rand_tok_words))
-
-                # Calculate cosine similarity w.r.t. each sampled token
-                random_cosines = xp.matmul(norm_embed[rand_tok_ids], norm_embed[tok_idx])
-                if verbose:
-                    print('random_cosines: {}'.format(random_cosines))
-
-                # Calculate Euclidean distance w.r.t. each sampled token
-                random_eucs = xp.linalg.norm(embed_mat[rand_tok_ids] - embed_mat[tok_idx], axis=1)
-                if verbose:
-                    print('random_eucs: {}'.format(random_eucs))
-
-                # Append new entries to respective lists
-                random_cosines_list.append(xp.array(random_cosines))
-                random_eucs_list.append(xp.array(random_eucs))
-                cosnn_cosines_list.append(xp.array(cosnn_cosines))
-                eucnn_eucs_list.append(xp.array(eucnn_eucs))
-                eucnn_cosines_list.append(xp.array(eucnn_cosines))
-                cosnn_eucs_list.append(xp.array(cosnn_eucs))
-
-                if verbose:
-                    print(' ')
-
-                counter += 1
-
-            random_cosines = xp.asnumpy(xp.stack(random_cosines_list))
-            random_eucs = xp.asnumpy(xp.stack(random_eucs_list))
-            cosnn_cosines = xp.asnumpy(xp.stack(cosnn_cosines_list))
-            eucnn_eucs = xp.asnumpy(xp.stack(eucnn_eucs_list))
-            eucnn_cosines = xp.asnumpy(xp.stack(eucnn_cosines_list))
-            cosnn_eucs = xp.asnumpy(xp.stack(cosnn_eucs_list))
-
-            # pik_file = 'summary_data_10000_5_5.pickle'
-            # with open(os.path.join('./', pik_file), 'wb') as handle:
-            #     pickle.dump(random_cosines, handle, protocol=pickle.HIGHEST_PROTOCOL)
-            #     pickle.dump(random_eucs, handle, protocol=pickle.HIGHEST_PROTOCOL)
-            #     pickle.dump(cosnn_cosines, handle, protocol=pickle.HIGHEST_PROTOCOL)
-            #     pickle.dump(eucnn_eucs, handle, protocol=pickle.HIGHEST_PROTOCOL)
-            #     pickle.dump(eucnn_cosines, handle, protocol=pickle.HIGHEST_PROTOCOL)
-            #     pickle.dump(cosnn_eucs, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
-            visualize.summary_histogram(cosnn_cosines, random_cosines, eucnn_cosines, folder=FLAGS.output_dir)
-
         def ugly_adv_iterator(model, eval_examples, xp=np):
             emb_counter = 0
             proj_counter = 0
@@ -1354,8 +1416,218 @@ def main():
             print('all_counter: {}'.format(all_counter))
             print('true_pred_counter: {}'.format(true_pred_counter))
 
-        # ugly_adv_iterator(model, eval_examples, xp=xp)
-        adv_demo_by_index(model, eval_examples, 58, epsilon=10.0, adv_k=1, prefix='_sparse', sparsity_keep=0.25, create_table=True, xp=xp)
+        def PCA_stats():
+            # Set the iterators
+            from sklearn.decomposition import PCA
+            adv_k = 1
+            epsilon = 0.6
+            sparsity_keep = None
+            batch_size = FLAGS.train_batch_size * 2
+
+            train_examples = processor.get_train_examples(FLAGS.data_dir)
+            test_examples = processor.get_test_examples(FLAGS.data_dir)
+
+            train_iter = chainer.iterators.SerialIterator(train_examples, batch_size, repeat=False, shuffle=False)
+            test_iter = chainer.iterators.SerialIterator(test_examples, batch_size, repeat=False, shuffle=False)
+
+            # Collect embeddings and outputs on training data
+            train_outputs = []
+            train_adv_outputs = []
+            # train_embeds = []
+            # train_adv_embeds = []
+            for train_batch in train_iter:
+                data = model.converter(train_batch, FLAGS.gpu)
+                input_ids, input_mask, segment_ids, label_id = data
+                adv_train_x = adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, sparsity_keep=sparsity_keep, xp=xp)
+                with chainer.using_config('train', False):
+                    pooled_out = model.bert.get_pooled_output(input_ids, input_mask, segment_ids).data
+                    train_outputs.append(xp.asnumpy(pooled_out))
+                    # embed_lookup = model.bert.word_embed_lookup.data
+                    # embed_lookup = embed_lookup.reshape(-1, embed_lookup.shape[-1])
+                    # train_embeds.append(xp.asnumpy(embed_lookup))
+                    # train_adv_embeds.append(xp.asnumpy(adv_train_x.data.reshape(-1, embed_lookup.shape[-1])))
+                    pooled_adv_out = model.bert(input_ids, input_mask, segment_ids, feed_word_embeddings=True, input_word_embeddings=adv_train_x).data
+                    train_adv_outputs.append(xp.asnumpy(pooled_adv_out))
+            train_outputs = np.concatenate(train_outputs, axis=0)
+            print(train_outputs.shape)
+            train_adv_outputs = np.concatenate(train_adv_outputs, axis=0)
+            print(train_adv_outputs.shape)
+            # train_embeds = np.concatenate(train_embeds, axis=0)
+            # print(train_embeds.shape)
+            # train_adv_embeds = np.concatenate(train_adv_embeds, axis=0)
+            # print(train_adv_embeds.shape)
+
+            # Collect embeddings and outputs on test data
+            test_outputs = []
+            test_adv_outputs = []
+            # test_embeds = []
+            # test_adv_embeds = []
+            for test_batch in test_iter:
+                data = model.converter(test_batch, FLAGS.gpu)
+                input_ids, input_mask, segment_ids, label_id = data
+                adv_test_x = adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, sparsity_keep=sparsity_keep, xp=xp)
+                with chainer.using_config('train', False):
+                    pooled_out = model.bert.get_pooled_output(input_ids, input_mask, segment_ids).data
+                    test_outputs.append(xp.asnumpy(pooled_out))
+                    # embed_lookup = model.bert.word_embed_lookup.data
+                    # embed_lookup = embed_lookup.reshape(-1, embed_lookup.shape[-1])
+                    # test_embeds.append(xp.asnumpy(embed_lookup))
+                    # test_adv_embeds.append(xp.asnumpy(adv_test_x.data.reshape(-1, embed_lookup.shape[-1])))
+                    pooled_adv_out = model.bert(input_ids, input_mask, segment_ids, feed_word_embeddings=True, input_word_embeddings=adv_test_x).data
+                    test_adv_outputs.append(xp.asnumpy(pooled_adv_out))
+            test_outputs = np.concatenate(test_outputs, axis=0)
+            print(test_outputs.shape)
+            test_adv_outputs = np.concatenate(test_adv_outputs, axis=0)
+            print(test_adv_outputs.shape)
+            # test_embeds = np.concatenate(test_embeds, axis=0)
+            # print(test_embeds.shape)
+            # test_adv_embeds = np.concatenate(test_adv_embeds, axis=0)
+            # print(test_adv_embeds.shape)
+
+            # Save the intermediary data
+            pik_file = 'pca_intermediary.pickle'
+            with open(os.path.join('./', pik_file), 'wb') as handle:
+                pickle.dump(train_outputs, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(train_adv_outputs, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(test_outputs, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(test_adv_outputs, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                # pickle.dump(train_embeds, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                # pickle.dump(train_adv_embeds, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                # pickle.dump(test_embeds, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                # pickle.dump(test_adv_embeds, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+            pik_file = 'pca_intermediary.pickle'
+            with open(os.path.join('./', pik_file), 'rb') as handle:
+                train_outputs = pickle.load(handle)
+                train_adv_outputs = pickle.load(handle)
+                test_outputs = pickle.load(handle)
+                test_adv_outputs = pickle.load(handle)
+                # train_embeds = pickle.load(handle)
+                # train_adv_embeds = pickle.load(handle)
+                # test_embeds = pickle.load(handle)
+                # test_adv_embeds = pickle.load(handle)
+
+            # Do PCA on train outputs
+            pca_outputs = PCA()
+            pca_outputs.fit(train_outputs)
+            print(pca_outputs.explained_variance_ratio_)
+            pca_outputs_params = pca_outputs.get_params()
+
+            train_outputs_transformed = pca_outputs.transform(train_outputs)
+            print(train_outputs_transformed.shape)
+            train_adv_outputs_transformed = pca_outputs.transform(train_adv_outputs)
+            print(train_adv_outputs_transformed.shape)
+            test_outputs_transformed = pca_outputs.transform(test_outputs)
+            print(test_outputs_transformed.shape)
+            test_adv_outputs_transformed = pca_outputs.transform(test_adv_outputs)
+            print(test_adv_outputs_transformed.shape)
+
+            pik_file = 'pca_outputs_train.pickle'
+            with open(os.path.join('./', pik_file), 'wb') as handle:
+                pickle.dump(pca_outputs_params, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(train_outputs_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(train_adv_outputs_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(test_outputs_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(test_adv_outputs_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+            # Do PCA on train embeddings
+            # pca_embeds = PCA()
+            # pca_embeds.fit(train_embeds)
+            # print(pca_embeds.explained_variance_ratio_)
+            # pca_embeds_params = pca_embeds.get_params()
+
+            # train_embeds_transformed = pca_embeds.transform(train_embeds)
+            # print(train_embeds_transformed.shape)
+            # train_adv_embeds_transformed = pca_embeds.transform(train_adv_embeds)
+            # print(train_adv_embeds_transformed.shape)
+            # test_embeds_transformed = pca_embeds.transform(test_embeds)
+            # print(test_embeds_transformed.shape)
+            # test_adv_embeds_transformed = pca_embeds.transform(test_adv_embeds)
+            # print(test_adv_embeds_transformed.shape)
+
+            # pik_file = 'pca_embeds_train.pickle'
+            # with open(os.path.join('./', pik_file), 'wb') as handle:
+            #     pickle.dump(pca_embeds_params, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            #     pickle.dump(train_embeds_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            #     pickle.dump(train_adv_embeds_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            #     pickle.dump(test_embeds_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            #     pickle.dump(test_adv_embeds_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+            # Read and plot the output data
+            pik_file = 'pca_outputs_train.pickle'
+            with open(os.path.join('./', pik_file), 'rb') as handle:
+                pca_outputs_params = pickle.load(handle)
+                train_outputs_transformed = pickle.load(handle)
+                train_adv_outputs_transformed = pickle.load(handle)
+                test_outputs_transformed = pickle.load(handle)
+                test_adv_outputs_transformed = pickle.load(handle)
+
+            train_outputs_scores = np.mean(np.abs(train_outputs_transformed), axis=0)
+            train_adv_outputs_scores = np.mean(np.abs(train_adv_outputs_transformed), axis=0)
+            test_outputs_scores = np.mean(np.abs(test_outputs_transformed), axis=0)
+            test_adv_outputs_scores = np.mean(np.abs(test_adv_outputs_transformed), axis=0)
+
+            print(train_outputs_scores)
+            print(train_adv_outputs_scores)
+            print(test_outputs_scores)
+            print(test_adv_outputs_scores)
+
+            visualize.PCA_score_plot(train_outputs_scores, train_adv_outputs_scores, 
+                test_outputs_scores, test_adv_outputs_scores, 'pooled_out', folder=FLAGS.output_dir)
+
+            # Read and plot the embedding data
+            # pik_file = 'pca_embeds_train.pickle'
+            # with open(os.path.join('./', pik_file), 'rb') as handle:
+            #     pca_embeds_params = pickle.load(handle)
+            #     train_embeds_transformed = pickle.load(handle)
+            #     train_adv_embeds_transformed = pickle.load(handle)
+            #     test_embeds_transformed = pickle.load(handle)
+            #     test_adv_embeds_transformed = pickle.load(handle)
+
+            # train_embeds_scores = np.mean(np.abs(train_embeds_transformed), axis=0)
+            # train_adv_embeds_scores = np.mean(np.abs(train_adv_embeds_transformed), axis=0)
+            # test_embeds_scores = np.mean(np.abs(test_embeds_transformed), axis=0)
+            # test_adv_embeds_scores = np.mean(np.abs(test_adv_embeds_transformed), axis=0)
+
+            # print(train_embeds_scores)
+            # print(train_adv_embeds_scores)
+            # print(test_embeds_scores)
+            # print(test_adv_embeds_scores)
+
+            # visualize.PCA_score_plot(train_embeds_scores, train_adv_embeds_scores, 
+            #     test_embeds_scores, test_adv_embeds_scores, 'embed_lookup', folder=FLAGS.output_dir)
+
+        # adv_demo_by_index(model, eval_examples, 58, epsilon=0.6, adv_k=1, prefix='_normal', sparsity_keep=None, proj=False, create_table=True, xp=xp)
+        # summary_statistics(model, eval_examples, verbose=False, xp=xp)
+            
+        # Set the iterators
+        adv_k = 1
+        epsilon = 0.6
+        sparsity_keep = None
+        batch_size = FLAGS.train_batch_size * 2
+        train_examples = processor.get_train_examples(FLAGS.data_dir)
+        test_examples = processor.get_test_examples(FLAGS.data_dir)
+        train_iter = chainer.iterators.SerialIterator(train_examples, batch_size, repeat=False, shuffle=False)
+        test_iter = chainer.iterators.SerialIterator(test_examples, batch_size, repeat=False, shuffle=False)
+
+        # Collect embeddings and outputs on training data
+        train_outputs = []
+        train_adv_outputs = []
+        # train_embeds = []
+        # train_adv_embeds = []
+        for train_batch in train_iter:
+            data = model.converter(train_batch, FLAGS.gpu)
+            input_ids, input_mask, segment_ids, label_id = data
+            adv_train_x = adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, sparsity_keep=sparsity_keep, xp=xp)
+            with chainer.using_config('train', False):
+                pooled_out = model.bert.get_pooled_output(input_ids, input_mask, segment_ids).data
+                train_outputs.append(xp.asnumpy(pooled_out))
+                # embed_lookup = model.bert.word_embed_lookup.data
+                # embed_lookup = embed_lookup.reshape(-1, embed_lookup.shape[-1])
+                # train_embeds.append(xp.asnumpy(embed_lookup))
+                # train_adv_embeds.append(xp.asnumpy(adv_train_x.data.reshape(-1, embed_lookup.shape[-1])))
+                pooled_adv_out = model.bert(input_ids, input_mask, segment_ids, feed_word_embeddings=True, input_word_embeddings=adv_train_x).data
+                train_adv_outputs.append(xp.asnumpy(pooled_adv_out))
 
 if __name__ == "__main__":
     main()
