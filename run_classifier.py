@@ -1416,190 +1416,234 @@ def main():
             print('all_counter: {}'.format(all_counter))
             print('true_pred_counter: {}'.format(true_pred_counter))
 
-        def PCA_stats():
-            # Set the iterators
+        def PCA_stats(model, do_embeds=False, do_outputs=True):
+
             from sklearn.decomposition import PCA
+
+            # Set the iterators and hyperparameters
             adv_k = 1
             epsilon = 0.6
             sparsity_keep = None
             batch_size = FLAGS.train_batch_size * 2
-
             train_examples = processor.get_train_examples(FLAGS.data_dir)
             test_examples = processor.get_test_examples(FLAGS.data_dir)
+
+            # Experiment with smaller portion of the data
+            # ----------------------------------------------------------------------
+            if True:
+                train_mid = int(len(train_examples)/2)
+                test_mid = int(len(test_examples)/2)
+                train_examples = train_examples[:512] + train_examples[train_mid:train_mid+512]
+                test_examples = test_examples[:512] + test_examples[test_mid:test_mid+512]
+            # ----------------------------------------------------------------------
 
             train_iter = chainer.iterators.SerialIterator(train_examples, batch_size, repeat=False, shuffle=False)
             test_iter = chainer.iterators.SerialIterator(test_examples, batch_size, repeat=False, shuffle=False)
 
+            # Sanity check for the pooled outputs calc. from the inputs vs. embeddings
+            # ----------------------------------------------------------------------
+            if False:
+                for train_batch in train_iter:
+                    data = model.converter(train_batch, FLAGS.gpu)
+                    input_ids, input_mask, segment_ids, label_id = data
+                    with chainer.using_config('train', False):
+                        pooled_out = model.bert.get_pooled_output(input_ids, input_mask, segment_ids).data
+                        embed_lookup = model.bert.word_embed_lookup
+                        pooled_out_sanity = model.bert(input_ids, input_mask, segment_ids, feed_word_embeddings=True, input_word_embeddings=embed_lookup).data
+                        print(pooled_out)
+                        print(pooled_out_sanity)
+                        print(xp.isclose(pooled_out, pooled_out_sanity))
+                        break
+                train_iter.reset()
+            # ----------------------------------------------------------------------
+
             # Collect embeddings and outputs on training data
             train_outputs = []
             train_adv_outputs = []
-            # train_embeds = []
-            # train_adv_embeds = []
+            train_embeds = []
+            train_adv_embeds = []
             for train_batch in train_iter:
                 data = model.converter(train_batch, FLAGS.gpu)
                 input_ids, input_mask, segment_ids, label_id = data
                 adv_train_x = adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, sparsity_keep=sparsity_keep, xp=xp)
                 with chainer.using_config('train', False):
-                    pooled_out = model.bert.get_pooled_output(input_ids, input_mask, segment_ids).data
-                    train_outputs.append(xp.asnumpy(pooled_out))
-                    # embed_lookup = model.bert.word_embed_lookup.data
-                    # embed_lookup = embed_lookup.reshape(-1, embed_lookup.shape[-1])
-                    # train_embeds.append(xp.asnumpy(embed_lookup))
-                    # train_adv_embeds.append(xp.asnumpy(adv_train_x.data.reshape(-1, embed_lookup.shape[-1])))
-                    pooled_adv_out = model.bert(input_ids, input_mask, segment_ids, feed_word_embeddings=True, input_word_embeddings=adv_train_x).data
-                    train_adv_outputs.append(xp.asnumpy(pooled_adv_out))
-            train_outputs = np.concatenate(train_outputs, axis=0)
-            print(train_outputs.shape)
-            train_adv_outputs = np.concatenate(train_adv_outputs, axis=0)
-            print(train_adv_outputs.shape)
-            # train_embeds = np.concatenate(train_embeds, axis=0)
-            # print(train_embeds.shape)
-            # train_adv_embeds = np.concatenate(train_adv_embeds, axis=0)
-            # print(train_adv_embeds.shape)
+                    if do_embeds:
+                        embed_lookup = model.bert.word_embed_lookup.data
+                        embed_lookup = embed_lookup.reshape(-1, embed_lookup.shape[-1])
+                        train_embeds.append(xp.asnumpy(embed_lookup))
+                        train_adv_embeds.append(xp.asnumpy(adv_train_x.data.reshape(-1, embed_lookup.shape[-1])))
+                    if do_outputs:
+                        pooled_out = model.bert.get_pooled_output(input_ids, input_mask, segment_ids).data
+                        train_outputs.append(xp.asnumpy(pooled_out))
+                        pooled_adv_out = model.bert(input_ids, input_mask, segment_ids, feed_word_embeddings=True, input_word_embeddings=adv_train_x).data
+                        train_adv_outputs.append(xp.asnumpy(pooled_adv_out))
+            if do_embeds:
+                train_embeds = np.concatenate(train_embeds, axis=0)
+                print(train_embeds.shape)
+                train_adv_embeds = np.concatenate(train_adv_embeds, axis=0)
+                print(train_adv_embeds.shape)
+            if do_outputs:
+                train_outputs = np.concatenate(train_outputs, axis=0)
+                print(train_outputs.shape)
+                train_adv_outputs = np.concatenate(train_adv_outputs, axis=0)
+                print(train_adv_outputs.shape)
 
             # Collect embeddings and outputs on test data
             test_outputs = []
             test_adv_outputs = []
-            # test_embeds = []
-            # test_adv_embeds = []
+            test_embeds = []
+            test_adv_embeds = []
             for test_batch in test_iter:
                 data = model.converter(test_batch, FLAGS.gpu)
                 input_ids, input_mask, segment_ids, label_id = data
                 adv_test_x = adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, sparsity_keep=sparsity_keep, xp=xp)
                 with chainer.using_config('train', False):
-                    pooled_out = model.bert.get_pooled_output(input_ids, input_mask, segment_ids).data
-                    test_outputs.append(xp.asnumpy(pooled_out))
-                    # embed_lookup = model.bert.word_embed_lookup.data
-                    # embed_lookup = embed_lookup.reshape(-1, embed_lookup.shape[-1])
-                    # test_embeds.append(xp.asnumpy(embed_lookup))
-                    # test_adv_embeds.append(xp.asnumpy(adv_test_x.data.reshape(-1, embed_lookup.shape[-1])))
-                    pooled_adv_out = model.bert(input_ids, input_mask, segment_ids, feed_word_embeddings=True, input_word_embeddings=adv_test_x).data
-                    test_adv_outputs.append(xp.asnumpy(pooled_adv_out))
-            test_outputs = np.concatenate(test_outputs, axis=0)
-            print(test_outputs.shape)
-            test_adv_outputs = np.concatenate(test_adv_outputs, axis=0)
-            print(test_adv_outputs.shape)
-            # test_embeds = np.concatenate(test_embeds, axis=0)
-            # print(test_embeds.shape)
-            # test_adv_embeds = np.concatenate(test_adv_embeds, axis=0)
-            # print(test_adv_embeds.shape)
+                    if do_embeds:
+                        embed_lookup = model.bert.word_embed_lookup.data
+                        embed_lookup = embed_lookup.reshape(-1, embed_lookup.shape[-1])
+                        test_embeds.append(xp.asnumpy(embed_lookup))
+                        test_adv_embeds.append(xp.asnumpy(adv_test_x.data.reshape(-1, embed_lookup.shape[-1])))
+                    if do_outputs:
+                        pooled_out = model.bert.get_pooled_output(input_ids, input_mask, segment_ids).data
+                        test_outputs.append(xp.asnumpy(pooled_out))
+                        pooled_adv_out = model.bert(input_ids, input_mask, segment_ids, feed_word_embeddings=True, input_word_embeddings=adv_test_x).data
+                        test_adv_outputs.append(xp.asnumpy(pooled_adv_out))
+            if do_embeds:
+                test_embeds = np.concatenate(test_embeds, axis=0)
+                print(test_embeds.shape)
+                test_adv_embeds = np.concatenate(test_adv_embeds, axis=0)
+                print(test_adv_embeds.shape)
+            if do_outputs:
+                test_outputs = np.concatenate(test_outputs, axis=0)
+                print(test_outputs.shape)
+                test_adv_outputs = np.concatenate(test_adv_outputs, axis=0)
+                print(test_adv_outputs.shape)
 
             # Save the intermediary data
             pik_file = 'pca_intermediary.pickle'
             with open(os.path.join('./', pik_file), 'wb') as handle:
-                pickle.dump(train_outputs, handle, protocol=pickle.HIGHEST_PROTOCOL)
-                pickle.dump(train_adv_outputs, handle, protocol=pickle.HIGHEST_PROTOCOL)
-                pickle.dump(test_outputs, handle, protocol=pickle.HIGHEST_PROTOCOL)
-                pickle.dump(test_adv_outputs, handle, protocol=pickle.HIGHEST_PROTOCOL)
-                # pickle.dump(train_embeds, handle, protocol=pickle.HIGHEST_PROTOCOL)
-                # pickle.dump(train_adv_embeds, handle, protocol=pickle.HIGHEST_PROTOCOL)
-                # pickle.dump(test_embeds, handle, protocol=pickle.HIGHEST_PROTOCOL)
-                # pickle.dump(test_adv_embeds, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                if do_outputs:
+                    pickle.dump(train_outputs, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    pickle.dump(train_adv_outputs, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    pickle.dump(test_outputs, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    pickle.dump(test_adv_outputs, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                if do_embeds:
+                    pickle.dump(train_embeds, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    pickle.dump(train_adv_embeds, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    pickle.dump(test_embeds, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    pickle.dump(test_adv_embeds, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
             pik_file = 'pca_intermediary.pickle'
             with open(os.path.join('./', pik_file), 'rb') as handle:
-                train_outputs = pickle.load(handle)
-                train_adv_outputs = pickle.load(handle)
-                test_outputs = pickle.load(handle)
-                test_adv_outputs = pickle.load(handle)
-                # train_embeds = pickle.load(handle)
-                # train_adv_embeds = pickle.load(handle)
-                # test_embeds = pickle.load(handle)
-                # test_adv_embeds = pickle.load(handle)
+                if do_outputs:
+                    train_outputs = pickle.load(handle)
+                    train_adv_outputs = pickle.load(handle)
+                    test_outputs = pickle.load(handle)
+                    test_adv_outputs = pickle.load(handle)
+                if do_embeds:
+                    train_embeds = pickle.load(handle)
+                    train_adv_embeds = pickle.load(handle)
+                    test_embeds = pickle.load(handle)
+                    test_adv_embeds = pickle.load(handle)
 
             # Do PCA on train outputs
-            pca_outputs = PCA()
-            pca_outputs.fit(train_outputs)
-            print(pca_outputs.explained_variance_ratio_)
-            pca_outputs_params = pca_outputs.get_params()
+            if do_outputs:
+                pca_outputs = PCA()
+                pca_outputs.fit(train_outputs)
+                print(pca_outputs.explained_variance_ratio_)
+                pca_outputs_params = pca_outputs.get_params()
 
-            train_outputs_transformed = pca_outputs.transform(train_outputs)
-            print(train_outputs_transformed.shape)
-            train_adv_outputs_transformed = pca_outputs.transform(train_adv_outputs)
-            print(train_adv_outputs_transformed.shape)
-            test_outputs_transformed = pca_outputs.transform(test_outputs)
-            print(test_outputs_transformed.shape)
-            test_adv_outputs_transformed = pca_outputs.transform(test_adv_outputs)
-            print(test_adv_outputs_transformed.shape)
+                train_outputs_transformed = pca_outputs.transform(train_outputs)
+                print(train_outputs_transformed.shape)
+                train_adv_outputs_transformed = pca_outputs.transform(train_adv_outputs)
+                print(train_adv_outputs_transformed.shape)
+                test_outputs_transformed = pca_outputs.transform(test_outputs)
+                print(test_outputs_transformed.shape)
+                test_adv_outputs_transformed = pca_outputs.transform(test_adv_outputs)
+                print(test_adv_outputs_transformed.shape)
 
-            pik_file = 'pca_outputs_train.pickle'
-            with open(os.path.join('./', pik_file), 'wb') as handle:
-                pickle.dump(pca_outputs_params, handle, protocol=pickle.HIGHEST_PROTOCOL)
-                pickle.dump(train_outputs_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
-                pickle.dump(train_adv_outputs_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
-                pickle.dump(test_outputs_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
-                pickle.dump(test_adv_outputs_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                pik_file = 'pca_outputs_train.pickle'
+                with open(os.path.join('./', pik_file), 'wb') as handle:
+                    pickle.dump(pca_outputs_params, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    pickle.dump(train_outputs_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    pickle.dump(train_adv_outputs_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    pickle.dump(test_outputs_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    pickle.dump(test_adv_outputs_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
             # Do PCA on train embeddings
-            # pca_embeds = PCA()
-            # pca_embeds.fit(train_embeds)
-            # print(pca_embeds.explained_variance_ratio_)
-            # pca_embeds_params = pca_embeds.get_params()
+            if do_embeds:
+                pca_embeds = PCA()
+                pca_embeds.fit(train_embeds)
+                print(pca_embeds.explained_variance_ratio_)
+                pca_embeds_params = pca_embeds.get_params()
 
-            # train_embeds_transformed = pca_embeds.transform(train_embeds)
-            # print(train_embeds_transformed.shape)
-            # train_adv_embeds_transformed = pca_embeds.transform(train_adv_embeds)
-            # print(train_adv_embeds_transformed.shape)
-            # test_embeds_transformed = pca_embeds.transform(test_embeds)
-            # print(test_embeds_transformed.shape)
-            # test_adv_embeds_transformed = pca_embeds.transform(test_adv_embeds)
-            # print(test_adv_embeds_transformed.shape)
+                train_embeds_transformed = pca_embeds.transform(train_embeds)
+                print(train_embeds_transformed.shape)
+                train_adv_embeds_transformed = pca_embeds.transform(train_adv_embeds)
+                print(train_adv_embeds_transformed.shape)
+                test_embeds_transformed = pca_embeds.transform(test_embeds)
+                print(test_embeds_transformed.shape)
+                test_adv_embeds_transformed = pca_embeds.transform(test_adv_embeds)
+                print(test_adv_embeds_transformed.shape)
 
-            # pik_file = 'pca_embeds_train.pickle'
-            # with open(os.path.join('./', pik_file), 'wb') as handle:
-            #     pickle.dump(pca_embeds_params, handle, protocol=pickle.HIGHEST_PROTOCOL)
-            #     pickle.dump(train_embeds_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
-            #     pickle.dump(train_adv_embeds_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
-            #     pickle.dump(test_embeds_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
-            #     pickle.dump(test_adv_embeds_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                pik_file = 'pca_embeds_train.pickle'
+                with open(os.path.join('./', pik_file), 'wb') as handle:
+                    pickle.dump(pca_embeds_params, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    pickle.dump(train_embeds_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    pickle.dump(train_adv_embeds_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    pickle.dump(test_embeds_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    pickle.dump(test_adv_embeds_transformed, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
             # Read and plot the output data
-            pik_file = 'pca_outputs_train.pickle'
-            with open(os.path.join('./', pik_file), 'rb') as handle:
-                pca_outputs_params = pickle.load(handle)
-                train_outputs_transformed = pickle.load(handle)
-                train_adv_outputs_transformed = pickle.load(handle)
-                test_outputs_transformed = pickle.load(handle)
-                test_adv_outputs_transformed = pickle.load(handle)
+            if do_outputs:
+                pik_file = 'pca_outputs_train.pickle'
+                with open(os.path.join('./', pik_file), 'rb') as handle:
+                    pca_outputs_params = pickle.load(handle)
+                    train_outputs_transformed = pickle.load(handle)
+                    train_adv_outputs_transformed = pickle.load(handle)
+                    test_outputs_transformed = pickle.load(handle)
+                    test_adv_outputs_transformed = pickle.load(handle)
 
-            train_outputs_scores = np.mean(np.abs(train_outputs_transformed), axis=0)
-            train_adv_outputs_scores = np.mean(np.abs(train_adv_outputs_transformed), axis=0)
-            test_outputs_scores = np.mean(np.abs(test_outputs_transformed), axis=0)
-            test_adv_outputs_scores = np.mean(np.abs(test_adv_outputs_transformed), axis=0)
+                train_outputs_scores = np.mean(np.abs(train_outputs_transformed), axis=0)
+                train_adv_outputs_scores = np.mean(np.abs(train_adv_outputs_transformed), axis=0)
+                test_outputs_scores = np.mean(np.abs(test_outputs_transformed), axis=0)
+                test_adv_outputs_scores = np.mean(np.abs(test_adv_outputs_transformed), axis=0)
 
-            print(train_outputs_scores)
-            print(train_adv_outputs_scores)
-            print(test_outputs_scores)
-            print(test_adv_outputs_scores)
+                print(train_outputs_scores)
+                print(train_adv_outputs_scores)
+                print(test_outputs_scores)
+                print(test_adv_outputs_scores)
 
-            visualize.PCA_score_plot(train_outputs_scores, train_adv_outputs_scores, 
-                test_outputs_scores, test_adv_outputs_scores, 'pooled_out', folder=FLAGS.output_dir)
+                visualize.PCA_score_plot(train_outputs_scores, train_adv_outputs_scores, 
+                    test_outputs_scores, test_adv_outputs_scores, 'pooled_out', folder=FLAGS.output_dir)
 
             # Read and plot the embedding data
-            # pik_file = 'pca_embeds_train.pickle'
-            # with open(os.path.join('./', pik_file), 'rb') as handle:
-            #     pca_embeds_params = pickle.load(handle)
-            #     train_embeds_transformed = pickle.load(handle)
-            #     train_adv_embeds_transformed = pickle.load(handle)
-            #     test_embeds_transformed = pickle.load(handle)
-            #     test_adv_embeds_transformed = pickle.load(handle)
+            if do_embeds:
+                pik_file = 'pca_embeds_train.pickle'
+                with open(os.path.join('./', pik_file), 'rb') as handle:
+                    pca_embeds_params = pickle.load(handle)
+                    train_embeds_transformed = pickle.load(handle)
+                    train_adv_embeds_transformed = pickle.load(handle)
+                    test_embeds_transformed = pickle.load(handle)
+                    test_adv_embeds_transformed = pickle.load(handle)
 
-            # train_embeds_scores = np.mean(np.abs(train_embeds_transformed), axis=0)
-            # train_adv_embeds_scores = np.mean(np.abs(train_adv_embeds_transformed), axis=0)
-            # test_embeds_scores = np.mean(np.abs(test_embeds_transformed), axis=0)
-            # test_adv_embeds_scores = np.mean(np.abs(test_adv_embeds_transformed), axis=0)
+                train_embeds_scores = np.mean(np.abs(train_embeds_transformed), axis=0)
+                train_adv_embeds_scores = np.mean(np.abs(train_adv_embeds_transformed), axis=0)
+                test_embeds_scores = np.mean(np.abs(test_embeds_transformed), axis=0)
+                test_adv_embeds_scores = np.mean(np.abs(test_adv_embeds_transformed), axis=0)
 
-            # print(train_embeds_scores)
-            # print(train_adv_embeds_scores)
-            # print(test_embeds_scores)
-            # print(test_adv_embeds_scores)
+                print(train_embeds_scores)
+                print(train_adv_embeds_scores)
+                print(test_embeds_scores)
+                print(test_adv_embeds_scores)
 
-            # visualize.PCA_score_plot(train_embeds_scores, train_adv_embeds_scores, 
-            #     test_embeds_scores, test_adv_embeds_scores, 'embed_lookup', folder=FLAGS.output_dir)
+                visualize.PCA_score_plot(train_embeds_scores, train_adv_embeds_scores, 
+                    test_embeds_scores, test_adv_embeds_scores, 'embed_lookup', folder=FLAGS.output_dir)
 
         # adv_demo_by_index(model, eval_examples, 58, epsilon=0.6, adv_k=1, prefix='_normal', sparsity_keep=None, proj=False, create_table=True, xp=xp)
         # summary_statistics(model, eval_examples, verbose=False, xp=xp)
 
+        PCA_stats(model, do_embeds=True, do_outputs=False)
 
 if __name__ == "__main__":
     main()
