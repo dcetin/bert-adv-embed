@@ -811,6 +811,12 @@ class AttentionLayer(chainer.Chain):
         attention_probs = F.dropout(
             attention_probs, self.attention_probs_dropout_prob)
 
+        # Save the attention scores and probabilities
+        # --------------------------------------
+        self.attention_scores = attention_scores
+        self.attention_probs = attention_probs
+        # --------------------------------------
+
         # `value_layer` = [B, T, N, H]
         value_layer = F.reshape(
             value_layer,

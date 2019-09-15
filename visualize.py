@@ -10,6 +10,19 @@ import pickle
 from matplotlib.patches import Rectangle
 
 def adv_table_helper(df, annot_nn, md, data, folder, norms=False):
+    """
+    Creates a table that illustrates the adversarial example and its perturbations.
+
+    Args:
+        df: Dataframe that contains the table to be outputted.
+        annot_nn: numpy array that stores annotations for the nearest neighbor table.
+        md: Dictionary that stores example metadata, 
+            for output file and table details.
+        data: Dictionary that stores example statistics.
+        folder: Output directory.
+        norms: If True, uses norms as annotations, instead of nearest neighbors.
+    """
+
     # vmin = math.floor(df.values.min())
     # vmin = df.values.min()
     vmin = 0.0
@@ -49,6 +62,18 @@ def adv_table_helper(df, annot_nn, md, data, folder, norms=False):
     plt.clf()
 
 def create_adv_table(data, metadata, folder='temp', save_norms=True):
+    """
+    Creates a table that illustrates the adversarial example and its perturbations.
+
+    Args:
+        data: Dictionary that stores example statistics.
+        metadata: Dictionary that stores example metadata, 
+            for output file and table details.
+        folder: Output directory.
+        save_norms: If True, creates an additional table that uses norms 
+            as annotations, besides the one that uses nearest neighbors.
+    """
+
     # General stuff
     md = metadata
     annot_nn = np.stack([data['emb_cos_nn'], data['per_cos_nn'], data['adv_cos_nn']], axis=1)
@@ -57,10 +82,23 @@ def create_adv_table(data, metadata, folder='temp', save_norms=True):
     df = df[['original', 'perturbation', 'adversarial']]
 
     adv_table_helper(df, annot_nn, md, data, folder)
-    adv_table_helper(df, annot_nn, md, data, folder, save_norms)
+    if save_norms:
+        adv_table_helper(df, annot_nn, md, data, folder, save_norms)
 
 def summary_histogram(measure, cosnn_meas, random_meas, eucnn_meas, per_meas, density=True, folder='temp', suffix=''):
+    """
+    Creates histograms to summarize different conditional embedding distributions.
 
+    Args:
+        measure: Name of the measure used in analysis, either 'cosine' or 'euclidean'.
+        cosnn_meas: Measurements for the cosine nearest neighbors distribution.
+        random_meas: Measurements for the randomly sampled distribution.
+        eucnn_meas: Measurements for the L2 nearest neighbors distribution.
+        per_meas: Measurements for the distribution formed by adversarial perturbations.
+        density: If True, counts will be normalized to form a probability density.
+        folder: Output directory.
+        suffix: Suffix string for output files.
+    """
     if suffix != '':
         suffix = '_' + str(suffix)
 
@@ -147,7 +185,17 @@ def summary_histogram(measure, cosnn_meas, random_meas, eucnn_meas, per_meas, de
     plt.clf()
 
 def PCA_score_plot(train_scores, train_adv_scores, test_scores, test_adv_scores, data_src, folder='temp'):
-    
+    """
+    Creates plots that illustrates PCA component scores for different datasets.
+
+    Args:
+        train_scores: Array of scores for original training data.
+        train_adv_scores: Array of scores for adversarial training data.
+        testscores: Array of scores for original test data.
+        testadv_scores: Array of scores for adversarial test data.
+        data_src: String denoting the source of the data; e.g. 'pooled_outputs'.
+        folder: Output directory.
+    """
     plt.plot(np.log(train_scores), 'r-', linewidth=1)
     plt.plot(np.log(train_adv_scores), 'g-', linewidth=1)
     plt.plot(np.log(test_scores), 'b-', linewidth=1)
@@ -175,13 +223,17 @@ def PCA_score_plot(train_scores, train_adv_scores, test_scores, test_adv_scores,
 
 if __name__ == "__main__":
 
-    # pik_file = 'example_adv_data.pickle'
-    # with open(os.path.join('./', pik_file), 'rb') as handle:
-    #     data = pickle.load(handle)
-    #     metadata = pickle.load(handle)
-    # metadata['name'] = 'example'
-    # create_adv_table(data, metadata, folder='out_imdb', save_norms=True)
+    '''
+    # Creates an example table to illustrate an adversarial sample.
+    pik_file = 'example_adv_data.pickle'
+    with open(os.path.join('./', pik_file), 'rb') as handle:
+        data = pickle.load(handle)
+        metadata = pickle.load(handle)
+    metadata['name'] = 'example'
+    create_adv_table(data, metadata, folder='out_imdb', save_norms=True)
+    '''
 
+    # Creates the histograms that summarize different distributions.
     pik_file = 'summary_data_10000_5_5.pickle'
     with open(os.path.join('./', pik_file), 'rb') as handle:
         random_cosines = pickle.load(handle)
