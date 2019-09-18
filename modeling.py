@@ -174,18 +174,26 @@ class BertClassifier(chainer.Chain):
             self.output = Linear3D(
                 None, num_labels,
                 initialW=create_initializer(initializer_range=0.02))
+            self.output_dropout = 0.1
 
-    def __call__(self, input_ids, input_mask, token_type_ids, labels):
+    def __call__(self, input_ids, input_mask, token_type_ids, labels, return_logits=False):
         output_layer = self.bert.get_pooled_output(
             input_ids,
             input_mask,
             token_type_ids)
-        output_layer = F.dropout(output_layer, 0.1)
+        output_layer = F.dropout(output_layer, self.output_dropout)
         logits = self.output(output_layer)
+        if return_logits:
+            return logits
         loss = F.softmax_cross_entropy(logits, labels)
         chainer.report({'loss': loss.array}, self)
         chainer.report({'accuracy': F.accuracy(logits, labels)}, self)
         return loss
+
+    def get_logits_from_output(self, output_layer):
+        output_layer = F.dropout(output_layer, self.output_dropout)
+        logits = self.output(output_layer)
+        return logits
 
 
 # For showing SQuAD accuracy with heuristics
@@ -329,7 +337,10 @@ class BertModel(chainer.Chain):
                  token_type_ids=None,
                  get_embedding_output=False,
                  get_all_encoder_layers=False,
-                 get_sequence_output=False):
+                 get_sequence_output=False,
+                 get_word_embeddings=False,
+                 feed_word_embeddings=False,
+                 input_word_embeddings=None):
         """Encode by BertModel.
 
         Args:
@@ -354,7 +365,13 @@ class BertModel(chainer.Chain):
                 shape=[batch_size, seq_length], dtype=np.int32)
 
         # Embed (sub-)words
-        embedding_output = self.word_embeddings(input_ids)
+        if feed_word_embeddings:
+            embedding_output = input_word_embeddings
+        else:
+            embedding_output = self.word_embeddings(input_ids)
+        self.word_embed_lookup = embedding_output
+        if get_word_embeddings:
+            return embedding_output
 
         # Add positional embeddings and token type embeddings, then layer
         # normalize and perform dropout.
@@ -411,6 +428,10 @@ class BertModel(chainer.Chain):
     def get_embedding_output(self, input_ids, input_mask=None, token_type_ids=None):
         return self.__call__(input_ids, input_mask, token_type_ids,
                              get_embedding_output=True)
+
+    def get_word_embeddings(self, input_ids, input_mask=None, token_type_ids=None):
+        return self.__call__(input_ids, input_mask, token_type_ids,
+                             get_word_embeddings=True)
 
     def get_all_encoder_layers(self, input_ids, input_mask=None, token_type_ids=None):
         return self.__call__(input_ids, input_mask, token_type_ids,
@@ -789,6 +810,12 @@ class AttentionLayer(chainer.Chain):
         # seem a bit unusual, but is taken from the original Transformer paper.
         attention_probs = F.dropout(
             attention_probs, self.attention_probs_dropout_prob)
+
+        # Save the attention scores and probabilities
+        # --------------------------------------
+        self.attention_scores = attention_scores
+        self.attention_probs = attention_probs
+        # --------------------------------------
 
         # `value_layer` = [B, T, N, H]
         value_layer = F.reshape(
