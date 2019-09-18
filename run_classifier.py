@@ -721,6 +721,18 @@ def get_adv_example(model, emb, adv, inp):
     data['adv_l2_norm'] = adv_l2_norm
     data['per_l2_norm'] = per_l2_norm
     data['cos_emb_adv'] = cos_emb_adv
+
+    # Transformer layers
+    layers = [getattr(model.bert.encoder, "layer_%d" % layer_idx) for layer_idx in range(model.bert.encoder.num_hidden_layers)]
+    print('{} ({})  hidden layers'.format(model.bert.encoder.num_hidden_layers, len(layers)))
+    # Attention outputs
+    for layer_idx in range(model.bert.encoder.num_hidden_layers):
+        print('layer_idx: {}'.format(layer_idx))
+        layer_name = "layer_%d" % layer_idx
+        layer = getattr(model.bert.encoder, layer_name)
+        print(layer.attention.attention_scores.data.shape)
+        print(layer.attention.attention_probs.data.shape)
+
     return data
 
 def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=None, 
@@ -999,7 +1011,7 @@ def adv_demo_by_index(model, eval_examples, sequence_offset, epsilon, adv_k=1, p
             else:
                 retval = False
 
-        if create_table:
+        if create_table or return_data:
             # Save the embedding arrays
             embed_x = model.bert.get_word_embeddings(input_ids, input_mask, segment_ids)
             embed_x = embed_x.data
@@ -1034,17 +1046,17 @@ def adv_demo_by_index(model, eval_examples, sequence_offset, epsilon, adv_k=1, p
             inp = input_ids[:seqlen]
 
             data = get_adv_example(model, emb, adv, inp)
+
+        if create_table:
             metadata = {}
             metadata['epsilon'] = str(epsilon)
             metadata['adv_k'] = str(adv_k)
             metadata['label'] = str(prediction_test[seq_idx]) + 'to' + str(prediction_adv_test[seq_idx])
             metadata['name'] = FLAGS.output_dir + prefix + str(sequence_offset)
-
             # pik_file = 'example_adv_data.pickle'
             # with open(os.path.join('./', pik_file), 'wb') as handle:
             #     pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
             #     pickle.dump(metadata, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
             visualize.create_adv_table(data, metadata, folder=FLAGS.output_dir, save_norms=True)
 
         if return_data:
@@ -1331,16 +1343,16 @@ def PCA_stats(model, do_embeds=False, do_outputs=True, subsample=False, save_dat
 
         pik_file = 'pca_intermediary.pickle'
         with open(os.path.join('./', pik_file), 'rb') as handle:
-        if do_outputs:
-            train_outputs = pickle.load(handle)
-            train_adv_outputs = pickle.load(handle)
-            test_outputs = pickle.load(handle)
-            test_adv_outputs = pickle.load(handle)
-        if do_embeds:
-            train_embeds = pickle.load(handle)
-            train_adv_embeds = pickle.load(handle)
-            test_embeds = pickle.load(handle)
-            test_adv_embeds = pickle.load(handle)
+            if do_outputs:
+                train_outputs = pickle.load(handle)
+                train_adv_outputs = pickle.load(handle)
+                test_outputs = pickle.load(handle)
+                test_adv_outputs = pickle.load(handle)
+            if do_embeds:
+                train_embeds = pickle.load(handle)
+                train_adv_embeds = pickle.load(handle)
+                test_embeds = pickle.load(handle)
+                test_adv_embeds = pickle.load(handle)
 
     # Do PCA on train outputs
     if do_outputs:
@@ -1802,7 +1814,7 @@ def main():
             print('Train accuracy:', accuracy_score(train_y, train_preds)) # 0.9575
             print('Test accuracy:', accuracy_score(test_y, test_preds)) # 0.74452
 
-        # adv_demo_by_index(model, eval_examples, 58, epsilon=0.6, adv_k=1, prefix='_normal', sparsity_keep=None, proj=False, create_table=True, xp=xp)
+        res, data = adv_demo_by_index(model, eval_examples, 58, epsilon=0.6, adv_k=1, prefix='_normal', sparsity_keep=None, proj=False, return_data=True, xp=xp)
 
 if __name__ == "__main__":
     main()
