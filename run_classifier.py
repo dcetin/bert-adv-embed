@@ -14,7 +14,6 @@
 # limitations under the License.
 """BERT finetuning runner."""
 
-
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -34,17 +33,20 @@ import chainer
 from chainer import functions as F
 from chainer import training
 from chainer.training import extensions
+from chainer.backends.cuda import to_cpu
 import numpy as np
 
 _logger = logging.getLogger(__name__)
 
 import random
 import pickle
+
 import utils
 import visualize
-from chainer.backends.cuda import to_cpu
+
 from sklearn.decomposition import PCA
-# import pdb; pdb.set_trace()
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
 
 def get_arguments():
     parser = argparse.ArgumentParser(description='Arxiv')
@@ -471,7 +473,7 @@ def _truncate_seq_pair(tokens_a, tokens_b, max_length):
             tokens_b.pop()
 
 
-# New functions
+# Adversarial stuff
 
 def adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=None, xp=np):
     """
@@ -1064,6 +1066,8 @@ def adv_demo_by_index(model, eval_examples, sequence_offset, epsilon, adv_k=1, p
         else:
             return retval
 
+# Experimental stuff
+
 def summary_statistics(model, eval_examples, n=10000, k=6, m=5, verbose=False, xp=np):
     """
     Creates histograms to summarize different conditional embedding distributions.
@@ -1452,6 +1456,7 @@ def PCA_stats(model, do_embeds=False, do_outputs=True, subsample=False, save_dat
         visualize.PCA_score_plot(train_embeds_scores, train_adv_embeds_scores, 
             test_embeds_scores, test_adv_embeds_scores, 'embed_lookup', folder=FLAGS.output_dir)
 
+
 def main():
     processors = {
         "cola": ColaProcessor,
@@ -1790,22 +1795,136 @@ def main():
             np.save('conf_succ.npy', conf_succ)
             np.save('conf_fail.npy', conf_fail)
 
+        def save_outputs():
+            subsample = False
+            subsample_offset = 32
+
+            # Set the iterators and hyperparameters
+            batch_size = FLAGS.train_batch_size * 2
+            train_examples = processor.get_train_examples(FLAGS.data_dir)
+            test_examples = processor.get_test_examples(FLAGS.data_dir)
+
+            # Experiment with smaller portion of the data
+            # ----------------------------------------------------------------------
+            if subsample:
+                train_mid = int(len(train_examples)/2)
+                test_mid = int(len(test_examples)/2)
+                train_examples = train_examples[:subsample_offset] + train_examples[train_mid:train_mid+subsample_offset]
+                test_examples = test_examples[:subsample_offset] + test_examples[test_mid:test_mid+subsample_offset]
+            # ----------------------------------------------------------------------
+
+            train_iter = chainer.iterators.SerialIterator(train_examples, batch_size, repeat=False, shuffle=False)
+            test_iter = chainer.iterators.SerialIterator(test_examples, batch_size, repeat=False, shuffle=False)
+
+            # Collect outputs on training data
+            train_outputs = []
+            train_adv_outputs_1_06_None = []
+            train_adv_outputs_3_02_None = []
+            train_adv_outputs_1_06_025 = []
+            train_adv_outputs_3_02_025 = []
+            for train_batch in train_iter:
+                data = model.converter(train_batch, FLAGS.gpu)
+                input_ids, input_mask, segment_ids, label_id = data
+
+                adv_train_x_1_06_None = adv_FGSM_k(model, data, k=1, epsilon=0.6, train=False, sparsity_keep=None, xp=xp)
+                adv_train_x_3_02_None = adv_FGSM_k(model, data, k=3, epsilon=0.2, train=False, sparsity_keep=None, xp=xp)
+                adv_train_x_1_06_025 = adv_FGSM_k(model, data, k=1, epsilon=0.6, train=False, sparsity_keep=0.25, xp=xp)
+                adv_train_x_3_02_025 = adv_FGSM_k(model, data, k=3, epsilon=0.2, train=False, sparsity_keep=0.25, xp=xp)
+
+                with chainer.using_config('train', False):
+                    pooled_out = model.bert.get_pooled_output(input_ids, input_mask, segment_ids).data
+                    train_outputs.append(xp.asnumpy(pooled_out))
+                    pooled_adv_out_1_06_None = model.bert(input_ids, input_mask, segment_ids, feed_word_embeddings=True, input_word_embeddings=adv_train_x_1_06_None).data
+                    train_adv_outputs_1_06_None.append(xp.asnumpy(pooled_adv_out_1_06_None))
+                    pooled_adv_out_3_02_None = model.bert(input_ids, input_mask, segment_ids, feed_word_embeddings=True, input_word_embeddings=adv_train_x_3_02_None).data
+                    train_adv_outputs_3_02_None.append(xp.asnumpy(pooled_adv_out_3_02_None))
+                    pooled_adv_out_1_06_025 = model.bert(input_ids, input_mask, segment_ids, feed_word_embeddings=True, input_word_embeddings=adv_train_x_1_06_025).data
+                    train_adv_outputs_1_06_025.append(xp.asnumpy(pooled_adv_out_1_06_025))
+                    pooled_adv_out_3_02_025 = model.bert(input_ids, input_mask, segment_ids, feed_word_embeddings=True, input_word_embeddings=adv_train_x_3_02_025).data
+                    train_adv_outputs_3_02_025.append(xp.asnumpy(pooled_adv_out_3_02_025))
+
+            train_outputs = np.concatenate(train_outputs, axis=0)
+            print(train_outputs.shape)
+            train_adv_outputs_1_06_None = np.concatenate(train_adv_outputs_1_06_None, axis=0)
+            print(train_adv_outputs_1_06_None.shape)
+            train_adv_outputs_3_02_None = np.concatenate(train_adv_outputs_3_02_None, axis=0)
+            print(train_adv_outputs_3_02_None.shape)
+            train_adv_outputs_1_06_025 = np.concatenate(train_adv_outputs_1_06_025, axis=0)
+            print(train_adv_outputs_1_06_025.shape)
+            train_adv_outputs_3_02_025 = np.concatenate(train_adv_outputs_3_02_025, axis=0)
+            print(train_adv_outputs_3_02_025.shape)
+
+            # Collect outputs on test data
+            test_outputs = []
+            test_adv_outputs_1_06_None = []
+            test_adv_outputs_3_02_None = []
+            test_adv_outputs_1_06_025 = []
+            test_adv_outputs_3_02_025 = []
+            for test_batch in test_iter:
+                data = model.converter(test_batch, FLAGS.gpu)
+                input_ids, input_mask, segment_ids, label_id = data
+
+                adv_test_x_1_06_None = adv_FGSM_k(model, data, k=1, epsilon=0.6, train=False, sparsity_keep=None, xp=xp)
+                adv_test_x_3_02_None = adv_FGSM_k(model, data, k=3, epsilon=0.2, train=False, sparsity_keep=None, xp=xp)
+                adv_test_x_1_06_025 = adv_FGSM_k(model, data, k=1, epsilon=0.6, train=False, sparsity_keep=0.25, xp=xp)
+                adv_test_x_3_02_025 = adv_FGSM_k(model, data, k=3, epsilon=0.2, train=False, sparsity_keep=0.25, xp=xp)
+
+                with chainer.using_config('train', False):
+                    pooled_out = model.bert.get_pooled_output(input_ids, input_mask, segment_ids).data
+                    test_outputs.append(xp.asnumpy(pooled_out))
+                    pooled_adv_out_1_06_None = model.bert(input_ids, input_mask, segment_ids, feed_word_embeddings=True, input_word_embeddings=adv_test_x_1_06_None).data
+                    test_adv_outputs_1_06_None.append(xp.asnumpy(pooled_adv_out_1_06_None))
+                    pooled_adv_out_3_02_None = model.bert(input_ids, input_mask, segment_ids, feed_word_embeddings=True, input_word_embeddings=adv_test_x_3_02_None).data
+                    test_adv_outputs_3_02_None.append(xp.asnumpy(pooled_adv_out_3_02_None))
+                    pooled_adv_out_1_06_025 = model.bert(input_ids, input_mask, segment_ids, feed_word_embeddings=True, input_word_embeddings=adv_test_x_1_06_025).data
+                    test_adv_outputs_1_06_025.append(xp.asnumpy(pooled_adv_out_1_06_025))
+                    pooled_adv_out_3_02_025 = model.bert(input_ids, input_mask, segment_ids, feed_word_embeddings=True, input_word_embeddings=adv_test_x_3_02_025).data
+                    test_adv_outputs_3_02_025.append(xp.asnumpy(pooled_adv_out_3_02_025))
+
+            test_outputs = np.concatenate(test_outputs, axis=0)
+            print(test_outputs.shape)
+            test_adv_outputs_1_06_None = np.concatenate(test_adv_outputs_1_06_None, axis=0)
+            print(test_adv_outputs_1_06_None.shape)
+            test_adv_outputs_3_02_None = np.concatenate(test_adv_outputs_3_02_None, axis=0)
+            print(test_adv_outputs_3_02_None.shape)
+            test_adv_outputs_1_06_025 = np.concatenate(test_adv_outputs_1_06_025, axis=0)
+            print(test_adv_outputs_1_06_025.shape)
+            test_adv_outputs_3_02_025 = np.concatenate(test_adv_outputs_3_02_025, axis=0)
+            print(test_adv_outputs_3_02_025.shape)
+
+            # Save and reload the intermediary data
+            pik_file = 'train_test_outputs.pickle'
+            with open(os.path.join('./', pik_file), 'wb') as handle:
+                pickle.dump(train_outputs, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(train_adv_outputs_1_06_None, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(train_adv_outputs_3_02_None, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(train_adv_outputs_1_06_025, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(train_adv_outputs_3_02_025, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(test_outputs, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(test_adv_outputs_1_06_None, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(test_adv_outputs_3_02_None, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(test_adv_outputs_1_06_025, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(test_adv_outputs_3_02_025, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
         def classify_encodings():
-
-            from sklearn.ensemble import RandomForestClassifier
-            from sklearn.metrics import accuracy_score
-
-            pik_file = 'pca_intermediary.pickle'
+            # Save and reload the intermediary data
+            pik_file = 'train_test_outputs.pickle'
             with open(os.path.join('./', pik_file), 'rb') as handle:
                 train_outputs = pickle.load(handle)
-                train_adv_outputs = pickle.load(handle)
+                train_adv_outputs_1_06_None = pickle.load(handle)
+                train_adv_outputs_3_02_None = pickle.load(handle)
+                train_adv_outputs_1_06_025 = pickle.load(handle)
+                train_adv_outputs_3_02_025 = pickle.load(handle)
                 test_outputs = pickle.load(handle)
-                test_adv_outputs = pickle.load(handle)
+                test_adv_outputs_1_06_None = pickle.load(handle)
+                test_adv_outputs_3_02_None = pickle.load(handle)
+                test_adv_outputs_1_06_025 = pickle.load(handle)
+                test_adv_outputs_3_02_025 = pickle.load(handle)
 
-            train_X = np.concatenate([train_outputs, train_adv_outputs], axis=0)
-            train_y = np.concatenate([np.ones(train_outputs.shape[0]), np.zeros(train_adv_outputs.shape[0])])
-            test_X = np.concatenate([test_outputs, test_adv_outputs], axis=0)
-            test_y = np.concatenate([np.ones(test_outputs.shape[0]), np.zeros(test_adv_outputs.shape[0])])
+            train_X = np.concatenate([train_outputs, train_adv_outputs_1_06_None], axis=0)
+            train_y = np.concatenate([np.ones(train_outputs.shape[0]), np.zeros(train_adv_outputs_1_06_None.shape[0])])
+            test_X = np.concatenate([test_outputs, test_adv_outputs_1_06_None], axis=0)
+            test_y = np.concatenate([np.ones(test_outputs.shape[0]), np.zeros(test_adv_outputs_1_06_None.shape[0])])
 
             clf = RandomForestClassifier(n_estimators=300, max_depth=18, random_state=FLAGS.random_seed, n_jobs=-1)
             clf.fit(train_X, train_y)
@@ -1814,7 +1933,8 @@ def main():
             print('Train accuracy:', accuracy_score(train_y, train_preds)) # 0.9575
             print('Test accuracy:', accuracy_score(test_y, test_preds)) # 0.74452
 
-        res, data = adv_demo_by_index(model, eval_examples, 58, epsilon=0.6, adv_k=1, prefix='_normal', sparsity_keep=None, proj=False, return_data=True, xp=xp)
+        # res, data = adv_demo_by_index(model, eval_examples, 58, epsilon=0.6, adv_k=1, prefix='_normal', sparsity_keep=None, proj=False, return_data=True, xp=xp)
+        classify_encodings()
 
 if __name__ == "__main__":
     main()

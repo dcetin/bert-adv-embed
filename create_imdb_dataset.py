@@ -40,6 +40,6 @@ def main(source, target):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--source", "-s", type=str, default="./aclImdb", help="Source IMDB directory (path to aclImdb)")
-    parser.add_argument("--target", "-t", type=str, default="./glue_data/IMDB", help="Target directory (ex: glue_data/IMDB)")
+    parser.add_argument("--target", "-t", type=str, default="./aclImdb", help="Target directory (ex: imdb_data)")
     args = parser.parse_args()
     main(**vars(args))
