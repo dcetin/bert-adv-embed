@@ -1,17 +1,24 @@
 # Adversarial embeddings for BERT
 
-Built on top of the [Chainer reimplementation](https://github.com/soskek/bert-chainer) of the Google Research's [original TensorFlow implementation](https://github.com/google-research/bert).
+Built on top of the [Chainer reimplementation](https://github.com/soskek/bert-chainer) of the Google Research's [original TensorFlow implementation](https://github.com/google-research/bert). IMDB loader and processor functions taken from [this branch](https://github.com/hsm207/bert/tree/imdb).
 
 ## Requirements
 
-- Python 3.5+
-- Chainer
-- CuPy
+- Python (3.6.4)
+- Chainer (6.0.0)
+- CuPy (6.1.0)
 
 ## Installation
 
+Install packages if they are not already present.
+```bash
+pip install cupy-cuda90 --no-cache-dir --user
+pip install chainer --user
+```
+
 Clone and enter the repository.
 ```bash
+# cd /cluster/scratch/nethzid
 git clone https://github.com/dcetin/bert-chainer.git
 cd bert-chainer
 # module load python_cpu/3.6.4 cuda/9.0.176
