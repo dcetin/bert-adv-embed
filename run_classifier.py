@@ -571,7 +571,7 @@ def evaluate_fn(eval_iter, device, model, converter, adversarial=False, sparsity
         device: GPU/CPU flag, indicating which device to use.
         model: Neural network model.
         converter: An instance of Converter class, to transform batches of data.
-        adversarial: If True, makes adversarial evaluation; if False, standard.
+        adversarial: If True, makes adversarial evaluation.
         sparsity_keep: Ratio of highest L2 norm perturbations to be kept.
         adv_k: Number of successive perturbation steps.
         epsilon: Norm coefficient of the perturbation.
@@ -579,6 +579,8 @@ def evaluate_fn(eval_iter, device, model, converter, adversarial=False, sparsity
     Returns:
         Mean losses and accuracies.
     """
+    random = False # random: If True, makes evaluation with random perturbations.
+
     xp = model.bert.xp
     eval_losses = []
     eval_accuracies = []
@@ -588,16 +590,19 @@ def evaluate_fn(eval_iter, device, model, converter, adversarial=False, sparsity
         input_ids, input_mask, segment_ids, label_id = data
 
         if adversarial:
-            adv_word_embed_lookup = adv_FGSM_k(model, data, 
+            eval_word_embed_lookup = adv_FGSM_k(model, data, 
                 epsilon=epsilon, k=adv_k, train=False, sparsity_keep=sparsity_keep, xp=xp)
+        elif random:
+            eval_word_embed_lookup = random_perturb(model, data, 
+                epsilon=epsilon, k=adv_k, sparsity_keep=sparsity_keep, xp=xp)
 
         with chainer.using_config('train', False):
             with chainer.no_backprop_mode():
 
-                if adversarial:
+                if adversarial or random:
                     # Adversarial evaluation: manual feed the embeds to bert
                     pooled_out = model.bert(input_ids, input_mask, segment_ids, 
-                        feed_word_embeddings=True, input_word_embeddings=adv_word_embed_lookup)
+                        feed_word_embeddings=True, input_word_embeddings=eval_word_embed_lookup)
                     pred_logits = model.get_logits_from_output(pooled_out)
                 else:
                     # Standard evaluation: the whole pipeline
@@ -1068,7 +1073,7 @@ def adv_demo_by_index(model, eval_examples, sequence_offset, epsilon, adv_k=1, p
 
 # Experimental stuff
 
-def summary_statistics(model, eval_examples, n=10000, k=6, m=5, verbose=False, xp=np):
+def summary_statistics(model, eval_examples, n=10000, k=6, m=5, verbose=False, mode='all', xp=np):
     """
     Creates histograms to summarize different conditional embedding distributions.
 
@@ -1080,6 +1085,8 @@ def summary_statistics(model, eval_examples, n=10000, k=6, m=5, verbose=False, x
             by one and slice outputs to disregard the nearest neighbor (usually itself).
         m: Number of random token samples for each base token.
         verbose: If True, prints all details for each sample.
+        mode: If 'all', samples tokens for all sequences; if 'adv', samples tokens only 
+            from the sequences with originally correct but adversarially flipped labels.
         xp: Matrix library, np for numpy and cp for cupy.
     """
     cosnn_cosines_list = []
@@ -1098,9 +1105,10 @@ def summary_statistics(model, eval_examples, n=10000, k=6, m=5, verbose=False, x
     if verbose:
         print('dataset_len: {}'.format(dataset_len))
 
-    counter = 0
+    all_counter = 0
+    adv_counter = 0
 
-    for i in range(n):
+    while True:
 
         # Pick a random sequence
         seq_idx = np.random.randint(dataset_len, size=1)[0]
@@ -1109,91 +1117,111 @@ def summary_statistics(model, eval_examples, n=10000, k=6, m=5, verbose=False, x
         if verbose:
             print('seq_idx: {}'.format(seq_idx))
 
-        # Pick a random token from that sequence
-        seqlen = int(sum(input_mask[0].tolist()))
-        tok_offset = np.random.randint(seqlen, size=1)[0]
-        tok_idx = input_ids[0, tok_offset].tolist()
-        tok_word = model.unvocab[tok_idx]
-        if verbose:
-            print('tok_offset: {}'.format(tok_offset))
-            print('tok_idx: {}'.format(tok_idx))
-            print('tok_word: {}'.format(tok_word))
+        # Predict on both original and adversarial embeddings
+        adv_embed = adv_FGSM_k(model, data, k=1, epsilon=0.6, train=False, sparsity_keep=None, xp=xp)
+        pred_logits = model(input_ids, input_mask, segment_ids, label_id, return_logits=True)
+        prediction_test = xp.argmax(pred_logits.data, axis=1)
+        pooled_out = model.bert(input_ids, input_mask, segment_ids, 
+            feed_word_embeddings=True, input_word_embeddings=adv_embed)
+        pred_logits = model.get_logits_from_output(pooled_out)
+        prediction_adv_test = xp.argmax(pred_logits.data, axis=1)
+        std = (prediction_test == label_id)
+        adv = (prediction_adv_test == label_id)
+        res = ~adv & std
 
-        # Get k Euclidean nearest neighbors of the word
-        eucnn_tok_ids, eucnn_eucs = utils.nn_vec_L2(embed_mat, embed_mat[tok_idx], k=k, return_vals=True, xp=xp)
-        eucnn_words = [model.unvocab[w] for w in eucnn_tok_ids.tolist()]
-        if verbose:
-            print('eucnn_words: {}'.format(eucnn_words))
-            print('eucnn_eucs: {}'.format(eucnn_eucs))
+        if mode == 'all' or (mode == 'adv' and res[0]):
+            # Pick a random token from that sequence
+            seqlen = int(sum(input_mask[0].tolist()))
+            tok_offset = np.random.randint(seqlen, size=1)[0]
+            tok_idx = input_ids[0, tok_offset].tolist()
+            tok_word = model.unvocab[tok_idx]
+            if verbose:
+                print('tok_offset: {}'.format(tok_offset))
+                print('tok_idx: {}'.format(tok_idx))
+                print('tok_word: {}'.format(tok_word))
 
-        # Get k cosine nearest neighbors of the word
-        cosnn_words, cosnn_cosines = utils.get_vec_nn(model, tok_idx, k=k, return_vals=True, norm_embed=None, xp=xp)
-        cosnn_tok_ids = [model.vocab[x] for x in cosnn_words.split(' ')]
-        if verbose:
-            print('cosnn_words: {}'.format(cosnn_words))
-            print('cosnn_cosines: {}'.format(cosnn_cosines))
+            # Get k Euclidean nearest neighbors of the word
+            eucnn_tok_ids, eucnn_eucs = utils.nn_vec_L2(embed_mat, embed_mat[tok_idx], k=k, return_vals=True, xp=xp)
+            eucnn_words = [model.unvocab[w] for w in eucnn_tok_ids.tolist()]
+            if verbose:
+                print('eucnn_words: {}'.format(eucnn_words))
+                print('eucnn_eucs: {}'.format(eucnn_eucs))
 
-        # Calculate the Euclidean distances w.r.t. cosine nearest neighbors
-        cosnn_eucs = xp.linalg.norm(embed_mat[cosnn_tok_ids] - embed_mat[tok_idx], axis=1)
-        if verbose:
-            print('cosnn_eucs: {}'.format(cosnn_eucs))
+            # Get k cosine nearest neighbors of the word
+            cosnn_words, cosnn_cosines = utils.get_vec_nn(model, tok_idx, k=k, return_vals=True, norm_embed=None, xp=xp)
+            cosnn_tok_ids = [model.vocab[x] for x in cosnn_words.split(' ')]
+            if verbose:
+                print('cosnn_words: {}'.format(cosnn_words))
+                print('cosnn_cosines: {}'.format(cosnn_cosines))
 
-        # Calculate the cosine similarities w.r.t. Euclidean nearest neighbors
-        eucnn_cosines = xp.matmul(norm_embed[eucnn_tok_ids], norm_embed[tok_idx])
-        if verbose:
-            print('eucnn_cosines: {}'.format(eucnn_cosines))
+            # Calculate the Euclidean distances w.r.t. cosine nearest neighbors
+            cosnn_eucs = xp.linalg.norm(embed_mat[cosnn_tok_ids] - embed_mat[tok_idx], axis=1)
+            if verbose:
+                print('cosnn_eucs: {}'.format(cosnn_eucs))
 
-        # Calculate the cosine similarity and Euclidean distance of th
-        adv = adv_FGSM_k(model, data, k=1, epsilon=0.6, train=False, sparsity_keep=None, xp=xp).data[0]
-        per_cosine = utils.cosine_vec(adv[tok_offset], embed_mat[tok_idx], xp=xp)
-        per_euc = xp.linalg.norm(adv[tok_offset] - embed_mat[tok_idx])
-        if verbose:
-            print('per_cosine: {}'.format(per_cosine))
-            print('per_euc: {}'.format(per_euc))
+            # Calculate the cosine similarities w.r.t. Euclidean nearest neighbors
+            eucnn_cosines = xp.matmul(norm_embed[eucnn_tok_ids], norm_embed[tok_idx])
+            if verbose:
+                print('eucnn_cosines: {}'.format(eucnn_cosines))
 
-        # Pick m random sequences
-        seq_ids = np.random.randint(dataset_len, size=m)
-        pls = eval_examples_array[seq_ids]
-        data_rand = model.converter(pls, FLAGS.gpu)
-        input_ids, input_mask, segment_ids, label_id = data_rand
-        if verbose:
-            print('seq_ids: {}'.format(seq_ids))
+            # Calculate the cosine similarity and Euclidean distance of the perturbed token
+            adv = adv_embed.data[0]
+            per_cosine = utils.cosine_vec(adv[tok_offset], embed_mat[tok_idx], xp=xp)
+            per_euc = xp.linalg.norm(adv[tok_offset] - embed_mat[tok_idx])
+            if verbose:
+                print('per_cosine: {}'.format(per_cosine))
+                print('per_euc: {}'.format(per_euc))
 
-        # Pick a random token from each of those sequences
-        seqlens = xp.sum(input_mask, axis=1).astype(int).tolist()
-        rand_tok_offsets = [np.random.randint(seqlen, size=1)[0] for seqlen in seqlens]
-        rand_tok_ids = [input_ids[i, tok_offset].tolist() for (i,tok_offset) in enumerate(rand_tok_offsets)]
-        rand_tok_words = [model.unvocab[rti] for rti in rand_tok_ids]
-        rand_tok_ids = xp.array(rand_tok_ids)
-        if verbose:
-            print('rand_tok_offsets: {}'.format(rand_tok_offsets))
-            print('rand_tok_ids: {}'.format(rand_tok_ids))
-            print('rand_tok_words: {}'.format(rand_tok_words))
+            # Pick m random sequences
+            seq_ids = np.random.randint(dataset_len, size=m)
+            pls = eval_examples_array[seq_ids]
+            data_rand = model.converter(pls, FLAGS.gpu)
+            input_ids, input_mask, segment_ids, label_id = data_rand
+            if verbose:
+                print('seq_ids: {}'.format(seq_ids))
 
-        # Calculate cosine similarity w.r.t. each sampled token
-        random_cosines = xp.matmul(norm_embed[rand_tok_ids], norm_embed[tok_idx])
-        if verbose:
-            print('random_cosines: {}'.format(random_cosines))
+            # Pick a random token from each of those sequences
+            seqlens = xp.sum(input_mask, axis=1).astype(int).tolist()
+            rand_tok_offsets = [np.random.randint(seqlen, size=1)[0] for seqlen in seqlens]
+            rand_tok_ids = [input_ids[i, tok_offset].tolist() for (i,tok_offset) in enumerate(rand_tok_offsets)]
+            rand_tok_words = [model.unvocab[rti] for rti in rand_tok_ids]
+            rand_tok_ids = xp.array(rand_tok_ids)
+            if verbose:
+                print('rand_tok_offsets: {}'.format(rand_tok_offsets))
+                print('rand_tok_ids: {}'.format(rand_tok_ids))
+                print('rand_tok_words: {}'.format(rand_tok_words))
 
-        # Calculate Euclidean distance w.r.t. each sampled token
-        random_eucs = xp.linalg.norm(embed_mat[rand_tok_ids] - embed_mat[tok_idx], axis=1)
-        if verbose:
-            print('random_eucs: {}'.format(random_eucs))
+            # Calculate cosine similarity w.r.t. each sampled token
+            random_cosines = xp.matmul(norm_embed[rand_tok_ids], norm_embed[tok_idx])
+            if verbose:
+                print('random_cosines: {}'.format(random_cosines))
 
-        # Append new entries to respective lists
-        random_cosines_list.append(xp.array(random_cosines))
-        random_eucs_list.append(xp.array(random_eucs))
-        cosnn_cosines_list.append(xp.array(cosnn_cosines))
-        eucnn_eucs_list.append(xp.array(eucnn_eucs))
-        eucnn_cosines_list.append(xp.array(eucnn_cosines))
-        cosnn_eucs_list.append(xp.array(cosnn_eucs))
-        per_cosine_list.append(xp.array(per_cosine))
-        per_euc_list.append(xp.array(per_euc))
+            # Calculate Euclidean distance w.r.t. each sampled token
+            random_eucs = xp.linalg.norm(embed_mat[rand_tok_ids] - embed_mat[tok_idx], axis=1)
+            if verbose:
+                print('random_eucs: {}'.format(random_eucs))
 
-        if verbose:
-            print(' ')
+            # Append new entries to respective lists
+            random_cosines_list.append(xp.array(random_cosines))
+            random_eucs_list.append(xp.array(random_eucs))
+            cosnn_cosines_list.append(xp.array(cosnn_cosines))
+            eucnn_eucs_list.append(xp.array(eucnn_eucs))
+            eucnn_cosines_list.append(xp.array(eucnn_cosines))
+            cosnn_eucs_list.append(xp.array(cosnn_eucs))
+            per_cosine_list.append(xp.array(per_cosine))
+            per_euc_list.append(xp.array(per_euc))
 
-        counter += 1
+            if verbose:
+                print(' ')
+
+            adv_counter += 1
+
+        all_counter += 1
+
+        if adv_counter == n:
+            break
+
+    print('counter: {}/{}'.format(adv_counter, all_counter))
 
     random_cosines = xp.asnumpy(xp.stack(random_cosines_list))
     random_eucs = xp.asnumpy(xp.stack(random_eucs_list))
@@ -1218,7 +1246,7 @@ def summary_statistics(model, eval_examples, n=10000, k=6, m=5, verbose=False, x
     visualize.summary_histogram('cosine', cosnn_cosines, random_cosines, eucnn_cosines, per_cosine, density=True, folder=FLAGS.output_dir)
     visualize.summary_histogram('euclidean', cosnn_eucs, random_eucs, eucnn_eucs, per_euc, density=True, folder=FLAGS.output_dir)
 
-def PCA_stats(model, do_embeds=False, do_outputs=True, subsample=False, save_data=False, subsample_offset=512):
+def PCA_stats(model, do_embeds=False, do_outputs=True, subsample=False, subsample_offset=512, on_adv=False, save_data=False, mode='all'):
     """
     Fits a PCA on specified layers and calculates component scores over all datasets.
 
@@ -1228,7 +1256,10 @@ def PCA_stats(model, do_embeds=False, do_outputs=True, subsample=False, save_dat
         do_outputs: Do the analysis on pooled encoding outputs (features).
         subsample: If True, only uses a smaller portion of the datasets.
         subsample_offset: How may examples to pick for both labels, if subsampling.
+        on_adv: If True, fits PCA on adversarial dataset rather than original one.
         save_data: If True, saves intermediary and transformed output arrays.
+        mode: If 'all', uses all sequences; if 'adv', uses the sequences with 
+            originally correct but adversarially flipped labels.
     """
 
     # Set the iterators and hyperparameters
@@ -1236,8 +1267,8 @@ def PCA_stats(model, do_embeds=False, do_outputs=True, subsample=False, save_dat
     epsilon = 0.6
     sparsity_keep = None
     batch_size = FLAGS.train_batch_size * 2
-    train_examples = processor.get_train_examples(FLAGS.data_dir)
-    test_examples = processor.get_test_examples(FLAGS.data_dir)
+    train_examples = model.processor.get_train_examples(FLAGS.data_dir)
+    test_examples = model.processor.get_test_examples(FLAGS.data_dir)
 
     # Experiment with smaller portion of the data
     # ----------------------------------------------------------------------
@@ -1278,16 +1309,40 @@ def PCA_stats(model, do_embeds=False, do_outputs=True, subsample=False, save_dat
         input_ids, input_mask, segment_ids, label_id = data
         adv_train_x = adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, sparsity_keep=sparsity_keep, xp=xp)
         with chainer.using_config('train', False):
+
+            if mode == 'adv':
+                pred_logits = model(input_ids, input_mask, segment_ids, label_id, return_logits=True)
+                prediction_test = xp.argmax(pred_logits.data, axis=1)
+                pooled_out = model.bert(input_ids, input_mask, segment_ids, 
+                    feed_word_embeddings=True, input_word_embeddings=adv_train_x)
+                pred_logits = model.get_logits_from_output(pooled_out)
+                prediction_adv_test = xp.argmax(pred_logits.data, axis=1)
+                std = (prediction_test == label_id)
+                adv = (prediction_adv_test == label_id)
+                res = ~adv & std
+                res_ids = xp.where(res.astype(int) == 1)[0].tolist()
+
             if do_embeds:
                 embed_lookup = model.bert.word_embed_lookup.data
                 embed_lookup = embed_lookup.reshape(-1, embed_lookup.shape[-1])
-                train_embeds.append(xp.asnumpy(embed_lookup))
-                train_adv_embeds.append(xp.asnumpy(adv_train_x.data.reshape(-1, embed_lookup.shape[-1])))
+                adv_embeds = adv_train_x.data.reshape(-1, embed_lookup.shape[-1])
+                if mode == 'all':
+                    train_embeds.append(xp.asnumpy(embed_lookup))
+                    train_adv_embeds.append(xp.asnumpy(adv_embeds))
+                if mode == 'adv':
+                    train_embeds.append(xp.asnumpy(embed_lookup[res_ids]))
+                    train_adv_embeds.append(xp.asnumpy(adv_embeds[res_ids]))
+
             if do_outputs:
                 pooled_out = model.bert.get_pooled_output(input_ids, input_mask, segment_ids).data
-                train_outputs.append(xp.asnumpy(pooled_out))
                 pooled_adv_out = model.bert(input_ids, input_mask, segment_ids, feed_word_embeddings=True, input_word_embeddings=adv_train_x).data
-                train_adv_outputs.append(xp.asnumpy(pooled_adv_out))
+                if mode == 'all':
+                    train_outputs.append(xp.asnumpy(pooled_out))
+                    train_adv_outputs.append(xp.asnumpy(pooled_adv_out))
+                if mode == 'adv':
+                    train_outputs.append(xp.asnumpy(pooled_out[res_ids]))
+                    train_adv_outputs.append(xp.asnumpy(pooled_adv_out[res_ids]))
+
     if do_embeds:
         train_embeds = np.concatenate(train_embeds, axis=0)
         print(train_embeds.shape)
@@ -1309,16 +1364,40 @@ def PCA_stats(model, do_embeds=False, do_outputs=True, subsample=False, save_dat
         input_ids, input_mask, segment_ids, label_id = data
         adv_test_x = adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, sparsity_keep=sparsity_keep, xp=xp)
         with chainer.using_config('train', False):
+
+            if mode == 'adv':
+                pred_logits = model(input_ids, input_mask, segment_ids, label_id, return_logits=True)
+                prediction_test = xp.argmax(pred_logits.data, axis=1)
+                pooled_out = model.bert(input_ids, input_mask, segment_ids, 
+                    feed_word_embeddings=True, input_word_embeddings=adv_test_x)
+                pred_logits = model.get_logits_from_output(pooled_out)
+                prediction_adv_test = xp.argmax(pred_logits.data, axis=1)
+                std = (prediction_test == label_id)
+                adv = (prediction_adv_test == label_id)
+                res = ~adv & std
+                res_ids = xp.where(res.astype(int) == 1)[0].tolist()
+
             if do_embeds:
                 embed_lookup = model.bert.word_embed_lookup.data
                 embed_lookup = embed_lookup.reshape(-1, embed_lookup.shape[-1])
-                test_embeds.append(xp.asnumpy(embed_lookup))
-                test_adv_embeds.append(xp.asnumpy(adv_test_x.data.reshape(-1, embed_lookup.shape[-1])))
+                adv_embeds = adv_test_x.data.reshape(-1, embed_lookup.shape[-1])
+                if mode == 'all':
+                    test_embeds.append(xp.asnumpy(embed_lookup))
+                    test_adv_embeds.append(xp.asnumpy(adv_embeds))
+                if mode == 'adv':
+                    test_embeds.append(xp.asnumpy(embed_lookup[res_ids]))
+                    test_adv_embeds.append(xp.asnumpy(adv_embeds[res_ids]))
+
             if do_outputs:
                 pooled_out = model.bert.get_pooled_output(input_ids, input_mask, segment_ids).data
-                test_outputs.append(xp.asnumpy(pooled_out))
                 pooled_adv_out = model.bert(input_ids, input_mask, segment_ids, feed_word_embeddings=True, input_word_embeddings=adv_test_x).data
-                test_adv_outputs.append(xp.asnumpy(pooled_adv_out))
+                if mode == 'all':
+                    test_outputs.append(xp.asnumpy(pooled_out))
+                    test_adv_outputs.append(xp.asnumpy(pooled_adv_out))
+                if mode == 'adv':
+                    test_outputs.append(xp.asnumpy(pooled_out[res_ids]))
+                    test_adv_outputs.append(xp.asnumpy(pooled_adv_out[res_ids]))
+
     if do_embeds:
         test_embeds = np.concatenate(test_embeds, axis=0)
         print(test_embeds.shape)
@@ -1361,7 +1440,10 @@ def PCA_stats(model, do_embeds=False, do_outputs=True, subsample=False, save_dat
     # Do PCA on train outputs
     if do_outputs:
         pca_outputs = PCA()
-        pca_outputs.fit(train_outputs)
+        if on_adv:
+            pca_outputs.fit(train_adv_outputs)
+        else:
+            pca_outputs.fit(train_outputs)
         print(pca_outputs.explained_variance_ratio_)
         pca_outputs_params = pca_outputs.get_params()
 
@@ -1386,7 +1468,10 @@ def PCA_stats(model, do_embeds=False, do_outputs=True, subsample=False, save_dat
     # Do PCA on train embeddings
     if do_embeds:
         pca_embeds = PCA()
-        pca_embeds.fit(train_embeds)
+        if on_adv:
+            pca_embeds.fit(train_adv_embeds)
+        else:
+            pca_embeds.fit(train_embeds)
         print(pca_embeds.explained_variance_ratio_)
         pca_embeds_params = pca_embeds.get_params()
 
@@ -1456,6 +1541,58 @@ def PCA_stats(model, do_embeds=False, do_outputs=True, subsample=False, save_dat
         visualize.PCA_score_plot(train_embeds_scores, train_adv_embeds_scores, 
             test_embeds_scores, test_adv_embeds_scores, 'embed_lookup', folder=FLAGS.output_dir)
 
+def random_perturb(model, data, epsilon=0.6, k=1, sparsity_keep=None, xp=np):
+    """
+    k-step FGSM on word embeddings.
+
+    Args:
+        model: Neural network model.
+        data: Output tuple of the converter.
+        epsilon: Norm coefficient of the perturbation.
+        k: Number of successive perturbation steps.
+        sparsity_keep: Ratio of highest L2 norm perturbations to be kept.
+        xp: Matrix library, np for numpy and cp for cupy.
+
+    Returns:
+        Perturbed embedding variable.
+    """
+
+    input_ids, input_mask, segment_ids, label_id = data
+    org_embed_lookup = model.bert.get_word_embeddings(input_ids, input_mask, segment_ids) # var: (64, 128, 768)
+    word_embed_lookup = org_embed_lookup
+
+    for i in range(k):
+        with chainer.using_config('train', False):
+            adv_g = chainer.Variable(xp.random.random_sample(word_embed_lookup.shape, dtype=xp.float32))
+
+            def sentence_level_norm(grads):
+                batchsize, embed_dim, maxlen = grads.shape
+                grads = F.reshape(grads, (batchsize, embed_dim * maxlen))
+                grads = F.normalize(grads, axis=1)
+                grads = F.reshape(grads, (batchsize, embed_dim, maxlen))
+                return grads
+
+            adv_p = epsilon * sentence_level_norm(adv_g) # sentence-level L_2
+            word_embed_lookup = word_embed_lookup + adv_p
+
+    if sparsity_keep is not None:
+        with chainer.using_config('train', False):
+            def sparsify_perturb(data, mask, keep_prob=0.75, xp=np):
+                seqlens = xp.sum(mask, axis=1)
+                keep_counts = xp.floor(seqlens * keep_prob)
+                norms = xp.linalg.norm(data, axis=2)
+                thresh = data.shape[1] - keep_counts[:, xp.newaxis]
+                sort_ids = xp.argsort(xp.argsort(norms, axis=-1))
+                sparse_mask = (sort_ids > thresh).astype(int)
+                data[sparse_mask == 0] = 0
+                return data
+
+            sparse_perturbation = sparsify_perturb(
+                word_embed_lookup.data - org_embed_lookup.data, input_mask, keep_prob=sparsity_keep, xp=xp)
+            word_embed_lookup.data = org_embed_lookup.data + sparse_perturbation
+
+    return word_embed_lookup
+
 
 def main():
     processors = {
@@ -1516,6 +1653,7 @@ def main():
     model.vocab = tokenizer.vocab
     model.unvocab = unvocab
     model.converter = converter
+    model.processor = processor
     # -------------------------------------------------------------------------------
 
     if FLAGS.do_resume:
@@ -1571,12 +1709,8 @@ def main():
         eval_examples = processor.get_test_examples(FLAGS.data_dir)
         test_iter = chainer.iterators.SerialIterator(eval_examples, FLAGS.train_batch_size * 2, repeat=False, shuffle=False)
 
-        # test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
-        #     adv_k=1, epsilon=FLAGS.adv_epsilon, adversarial=True)
-        # print('[test  adv] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
-
-        # test_loss, test_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter)
-        # print('[test ] loss:{:.04f} acc:{:.04f}'.format(test_loss, test_acc))
+        test_loss, test_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter)
+        print('[test ] loss:{:.04f} acc:{:.04f}'.format(test_loss, test_acc))
 
         # test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
         #     adv_k=1, epsilon=0.6, adversarial=True)
@@ -1590,9 +1724,9 @@ def main():
         #     adv_k=3, epsilon=0.2, adversarial=True)
         # print('[test 3x0.2] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
 
-        test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
-            adv_k=3, epsilon=0.2, adversarial=True, sparsity_keep=0.25)
-        print('[test 3x0.2[0.25]] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
+        # test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
+        #     adv_k=3, epsilon=0.2, adversarial=True, sparsity_keep=0.25)
+        # print('[test 3x0.2[0.25]] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
 
     if FLAGS.do_experiment:
 
@@ -1906,35 +2040,62 @@ def main():
                 pickle.dump(test_adv_outputs_1_06_025, handle, protocol=pickle.HIGHEST_PROTOCOL)
                 pickle.dump(test_adv_outputs_3_02_025, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
-        def classify_encodings():
+        def classify_encodings(train_1='train_outputs', test_1='test_outputs', train_0='train_adv_outputs_1_06_None', test_0='test_adv_outputs_1_06_None'):
+            outputs = {}
+
             # Save and reload the intermediary data
             pik_file = 'train_test_outputs.pickle'
             with open(os.path.join('./', pik_file), 'rb') as handle:
-                train_outputs = pickle.load(handle)
-                train_adv_outputs_1_06_None = pickle.load(handle)
-                train_adv_outputs_3_02_None = pickle.load(handle)
-                train_adv_outputs_1_06_025 = pickle.load(handle)
-                train_adv_outputs_3_02_025 = pickle.load(handle)
-                test_outputs = pickle.load(handle)
-                test_adv_outputs_1_06_None = pickle.load(handle)
-                test_adv_outputs_3_02_None = pickle.load(handle)
-                test_adv_outputs_1_06_025 = pickle.load(handle)
-                test_adv_outputs_3_02_025 = pickle.load(handle)
+                outputs['train_outputs'] = pickle.load(handle)
+                outputs['train_adv_outputs_1_06_None'] = pickle.load(handle)
+                outputs['train_adv_outputs_3_02_None'] = pickle.load(handle)
+                outputs['train_adv_outputs_1_06_025'] = pickle.load(handle)
+                outputs['train_adv_outputs_3_02_025'] = pickle.load(handle)
+                outputs['test_outputs'] = pickle.load(handle)
+                outputs['test_adv_outputs_1_06_None'] = pickle.load(handle)
+                outputs['test_adv_outputs_3_02_None'] = pickle.load(handle)
+                outputs['test_adv_outputs_1_06_025'] = pickle.load(handle)
+                outputs['test_adv_outputs_3_02_025'] = pickle.load(handle)
 
-            train_X = np.concatenate([train_outputs, train_adv_outputs_1_06_None], axis=0)
-            train_y = np.concatenate([np.ones(train_outputs.shape[0]), np.zeros(train_adv_outputs_1_06_None.shape[0])])
-            test_X = np.concatenate([test_outputs, test_adv_outputs_1_06_None], axis=0)
-            test_y = np.concatenate([np.ones(test_outputs.shape[0]), np.zeros(test_adv_outputs_1_06_None.shape[0])])
+            print('train_0: {}, train_1: {}'.format(train_0, train_1))
+            print('test_0: {}, test_1: {}'.format(test_0, test_1))
 
-            clf = RandomForestClassifier(n_estimators=300, max_depth=18, random_state=FLAGS.random_seed, n_jobs=-1)
-            clf.fit(train_X, train_y)
-            train_preds = clf.predict(train_X)
-            test_preds = clf.predict(test_X)
-            print('Train accuracy:', accuracy_score(train_y, train_preds)) # 0.9575
-            print('Test accuracy:', accuracy_score(test_y, test_preds)) # 0.74452
+            train_0 = outputs[train_0]
+            test_0 = outputs[test_0]
+            train_1 = outputs[train_1]
+            test_1 = outputs[test_1]
 
-        # res, data = adv_demo_by_index(model, eval_examples, 58, epsilon=0.6, adv_k=1, prefix='_normal', sparsity_keep=None, proj=False, return_data=True, xp=xp)
-        classify_encodings()
+            train_X = np.concatenate([train_1, train_0], axis=0)
+            train_y = np.concatenate([np.ones(train_1.shape[0]), np.zeros(train_0.shape[0])])
+            test_X = np.concatenate([test_1, test_0], axis=0)
+            test_y = np.concatenate([np.ones(test_1.shape[0]), np.zeros(test_0.shape[0])])
+
+            for depth in [5,10,20]:
+                print('RF Depth:', depth)
+                clf = RandomForestClassifier(n_estimators=300, max_depth=depth, random_state=FLAGS.random_seed, n_jobs=-1)
+                clf.fit(train_X, train_y)
+                train_preds = clf.predict(train_X)
+                test_preds = clf.predict(test_X)
+                print('Train accuracy:', accuracy_score(train_y, train_preds))
+                print('Test accuracy:', accuracy_score(test_y, test_preds))
+            print(' ')
+        
+        # Pooled output classification experiments
+        if False:
+            # Separate original outputs from adversarial (1_06_None), standard setting
+            classify_encodings(train_1='train_outputs', test_1='test_outputs', train_0='train_adv_outputs_1_06_None', test_0='test_adv_outputs_1_06_None')
+            # Separate original outputs from adversarial (3_02_None), standard setting
+            classify_encodings(train_1='train_outputs', test_1='test_outputs', train_0='train_adv_outputs_3_02_None', test_0='test_adv_outputs_3_02_None')
+            # Separate original outputs from adversarial, train on 1-step and test on 3-step
+            classify_encodings(train_1='train_outputs', test_1='test_outputs', train_0='train_adv_outputs_1_06_None', test_0='test_adv_outputs_3_02_None')
+            # Separate original outputs from adversarial, train on 3-step and test on 1-step
+            classify_encodings(train_1='train_outputs', test_1='test_outputs', train_0='train_adv_outputs_3_02_None', test_0='test_adv_outputs_1_06_None')
+            # Nonsensical evaluation scheme, as a sanity check
+            classify_encodings(train_1='train_outputs', test_1='test_adv_outputs_1_06_None', train_0='test_outputs', test_0='train_adv_outputs_1_06_None')
+
+        # summary_statistics(model, eval_examples, n=10000, k=6, m=5, verbose=False, mode='adv', xp=xp)
+        PCA_stats(model, do_embeds=True, do_outputs=False, subsample=False, mode='adv')
+        # PCA_stats(model, do_embeds=False, do_outputs=True, subsample=False, mode='adv')
 
 if __name__ == "__main__":
     main()

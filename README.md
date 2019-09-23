@@ -71,3 +71,41 @@ python run_classifier.py \
   --do_resume=true \
   --do_experiment=true \
 ```
+
+## Notes
+
+- Features the classifier utilize (i.e. output of the penultimate layer, pooled encodings) for all evaluation runs (standard and all four adversarial cases) can be found online. It is what the save_outputs function creates and writes.
+```bash
+wget 'https://n.ethz.ch/~dcetin/download/train_test_outputs.pickle'
+```
+
+- Output the summary_statistics function dumps can also be found online. One can simply call summary_histogram or any other function on the sampled data.
+```bash
+wget 'https://n.ethz.ch/~dcetin/download/summary_data_10000_5_5.pickle'
+```
+
+- Training/evaluation on GLUE tasks (e.g. MRPC) can be done as shown below, after downloading the TensorFlow BERT checkpoints. Be aware that some experimental functions are explicitly written for IMDB dataset and may not work or work in unintended ways for other tasks.
+```bash
+# module load python_cpu/3.6.4 cuda/9.0.176
+wget "https://n.ethz.ch/~dcetin/download/download_glue_data.py"
+python download_glue_data.py
+export GLUE_DIR=./glue_data
+```
+```bash
+# module load python_gpu/3.6.4 cuda/9.0.176
+# bsub -n 6 -W 4:00 -R "rusage[mem=1024, ngpus_excl_p=1]" -R "select[gpu_model0==TeslaV100_SXM2_32GB]" \
+python run_classifier.py \
+  --task_name MRPC \
+  --data_dir $GLUE_DIR/MRPC/ \
+  --vocab_file $BERT_BASE_DIR/vocab.txt \
+  --bert_config_file $BERT_BASE_DIR/bert_config.json \
+  --init_checkpoint $BERT_BASE_DIR/arrays_bert_model.ckpt.npz \
+  --max_seq_length 128 \
+  --train_batch_size 16 \
+  --learning_rate 2e-5 \
+  --num_train_epochs 3.0 \
+  --output_dir=./mrpc_output
+  --do_train True \
+  --do_eval True \
+  --do_lower_case True \
+```
