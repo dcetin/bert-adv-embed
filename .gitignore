@@ -2,6 +2,7 @@
 res_*/
 temp/
 lsf.o*
+debug_out
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
