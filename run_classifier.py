@@ -1865,7 +1865,7 @@ def main():
             print('all_counter: {}'.format(all_counter))
             print('true_pred_counter: {}'.format(true_pred_counter))
 
-        def confidence_stats(model):
+        def confidence_stats(model, subsample=False, subsample_offset=512, xp=np):
             # Set the iterators and hyperparameters
             adv_k = 1
             epsilon = 0.6
@@ -1876,11 +1876,11 @@ def main():
 
             # Experiment with smaller portion of the data
             # ----------------------------------------------------------------------
-            if False:
+            if subsample:
                 train_mid = int(len(train_examples)/2)
                 test_mid = int(len(test_examples)/2)
-                train_examples = train_examples[:512] + train_examples[train_mid:train_mid+512]
-                test_examples = test_examples[:512] + test_examples[test_mid:test_mid+512]
+                train_examples = train_examples[:subsample_offset] + train_examples[train_mid:train_mid+subsample_offset]
+                test_examples = test_examples[:subsample_offset] + test_examples[test_mid:test_mid+subsample_offset]
             # ----------------------------------------------------------------------
 
             train_mid = int(len(train_examples)/2)
@@ -1929,10 +1929,7 @@ def main():
             np.save('conf_succ.npy', conf_succ)
             np.save('conf_fail.npy', conf_fail)
 
-        def save_outputs():
-            subsample = False
-            subsample_offset = 32
-
+        def save_outputs(model, subsample=False, subsample_offset=512, xp=np):
             # Set the iterators and hyperparameters
             batch_size = FLAGS.train_batch_size * 2
             train_examples = processor.get_train_examples(FLAGS.data_dir)
@@ -2094,8 +2091,10 @@ def main():
             classify_encodings(train_1='train_outputs', test_1='test_adv_outputs_1_06_None', train_0='test_outputs', test_0='train_adv_outputs_1_06_None')
 
         # summary_statistics(model, eval_examples, n=10000, k=6, m=5, verbose=False, mode='adv', xp=xp)
-        PCA_stats(model, do_embeds=True, do_outputs=False, subsample=False, mode='adv')
+        # PCA_stats(model, do_embeds=True, do_outputs=False, subsample=False, mode='adv')
         # PCA_stats(model, do_embeds=False, do_outputs=True, subsample=False, mode='adv')
+
+        confidence_stats(model, subsample=True, subsample_offset=32, xp=xp)
 
 if __name__ == "__main__":
     main()
