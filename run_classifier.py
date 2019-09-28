@@ -743,7 +743,7 @@ def get_adv_example(model, emb, adv, inp):
     return data
 
 def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=None, 
-    token_budget=0.15, redundancy=True, max_step=50, verbose=False, xp=np):
+    token_budget=0.15, redundancy=True, max_step=50, verbose=False, proj_nn='cosine', xp=np):
     """
     k-step FGSM on word embeddings.
 
@@ -758,6 +758,7 @@ def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=No
         redundancy: If True, zero-out naively selected redundant perturbations.
         max_step: Maximum number of iterations of adversarial perturbations.
         verbose: If True, prints outputs for each iteration.
+        proj_nn: similarity metric to be used to project the embedding to nearest neighbors.
         xp: Matrix library, np for numpy and cp for cupy.
 
     Returns:
@@ -800,6 +801,9 @@ def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=No
     step = 0
     token_budget = int(token_budget * input_ids.size)
     retval = None
+
+    if verbose:
+        print('Projecting using {} metric'.format(proj_nn))
 
     while True:
         for i in range(k):
@@ -845,12 +849,19 @@ def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=No
                 print('Step {}'.format(step))
             adv_test_x = word_embed_lookup
 
-            # Calculate cosine nearest neighbors
-            adv_cos_nn_ids = utils.get_seq_nn(model, adv_test_x.data[0], norm_embed=norm_embed, get_ids=True, xp=xp)
-            adv_cos_nn_ids = adv_cos_nn_ids[xp.newaxis,:]
+            if proj_nn == 'cosine':
+                # Calculate cosine nearest neighbors
+                adv_nn_ids = utils.get_seq_nn(model, adv_test_x.data[0], norm_embed=norm_embed, get_ids=True, xp=xp)
+                adv_nn_ids = adv_nn_ids[xp.newaxis,:]
+            elif proj_nn == 'euclidean' or proj_nn == 'l2':
+                # Calculate L2 nearest neighbors
+                emb = org_embed_lookup.data[0]
+                per = adv_test_x.data[0] - emb
+                adv_nn_ids = [utils.nn_vec_L2(embed_mat - emb[wi], per[wi], k=1, return_vals=False, xp=xp) for wi in range(len(per))]
+                adv_nn_ids = xp.array(adv_nn_ids, dtype=int)[xp.newaxis,:]
 
             # Note the differences between original and adversarial-to-be input
-            diff_ids = [(e, (w1,w2)) for (e, (w1,w2)) in enumerate(zip(input_ids[0].tolist(), adv_cos_nn_ids[0].tolist())) if w1 != w2]
+            diff_ids = [(e, (w1,w2)) for (e, (w1,w2)) in enumerate(zip(input_ids[0].tolist(), adv_nn_ids[0].tolist())) if w1 != w2]
             diff_tokens = [(model.unvocab[w1],model.unvocab[w2]) for (e, (w1,w2)) in diff_ids]
 
             # See if Projected FGSM changes any ordinary tokens to special tokens or vice versa
@@ -858,9 +869,9 @@ def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=No
             if len(illegal)  > 0:
                 # Revert illegal changes
                 for (e, x) in illegal:
-                    adv_cos_nn_ids[0,e] = input_ids[0,e]
+                    adv_nn_ids[0,e] = input_ids[0,e]
                 # Reiterate over differences
-                diff_ids = [(e, (w1,w2)) for (e, (w1,w2)) in enumerate(zip(input_ids[0].tolist(), adv_cos_nn_ids[0].tolist())) if w1 != w2]
+                diff_ids = [(e, (w1,w2)) for (e, (w1,w2)) in enumerate(zip(input_ids[0].tolist(), adv_nn_ids[0].tolist())) if w1 != w2]
                 diff_tokens = [(model.unvocab[w1],model.unvocab[w2]) for (e, (w1,w2)) in diff_ids]
 
             if step > max_step or len(diff_tokens) > token_budget:
@@ -872,7 +883,7 @@ def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=No
                     print('Changed ' + ', '.join([ x + ' to ' +  y for (x,y) in diff_tokens]))
 
                 # Prediction on adversarial data
-                pred_logits = model(adv_cos_nn_ids, input_mask, segment_ids, label_id, return_logits=True)
+                pred_logits = model(adv_nn_ids, input_mask, segment_ids, label_id, return_logits=True)
                 prediction_adv_test = xp.argmax(pred_logits.data, axis=1)
 
                 # Compare predictions and get the indices of the adversarial examples
@@ -891,7 +902,7 @@ def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=No
                         while True:
                             new_diff_ids = []
                             for (e, (w1,w2)) in diff_ids:
-                                temp_ids = xp.copy(adv_cos_nn_ids)
+                                temp_ids = xp.copy(adv_nn_ids)
                                 temp_ids[0,e] = input_ids[0,e]
                                 pred_logits = model(temp_ids, input_mask, segment_ids, label_id, return_logits=True)
                                 prediction_adv_test = xp.argmax(pred_logits.data, axis=1)
@@ -900,7 +911,7 @@ def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=No
                                 if res[0]:
                                     if verbose:
                                         print((e, (w1,w2)), 'is redundant')
-                                    adv_cos_nn_ids[0,e] = input_ids[0,e]
+                                    adv_nn_ids[0,e] = input_ids[0,e]
                                 else:
                                     new_diff_ids.append((e, (w1,w2)))
                             if new_diff_ids == diff_ids:
@@ -908,7 +919,7 @@ def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=No
                             else:
                                 diff_ids = new_diff_ids
 
-                    retval = adv_cos_nn_ids
+                    retval = adv_nn_ids
                     break
             else:
                 if verbose:
@@ -936,10 +947,13 @@ def proj_adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=No
                 print('Token budget ({}) exceeded.\n'.format(token_budget))
         else:
             print('Adversarial text found with {} changes (<{}).\n'.format(len(diff_ids), token_budget))
+            diff_tokens = [(model.unvocab[w1],model.unvocab[w2]) for (e, (w1,w2)) in diff_ids]
+            print(utils.to_sent(input_ids[0].tolist(), model.unvocab))
+            print(diff_tokens)
     return retval
 
 def adv_demo_by_index(model, eval_examples, sequence_offset, epsilon, adv_k=1, prefix='', 
-    sparsity_keep=None, proj=True, create_table=False, early_return=True, return_data=False, xp=np):
+    sparsity_keep=None, proj=True, proj_nn='cosine', create_table=False, early_return=True, return_data=False, xp=np):
     """
     Wrapper for creating an adversarial example on a specific input and analysing it.
 
@@ -953,6 +967,7 @@ def adv_demo_by_index(model, eval_examples, sequence_offset, epsilon, adv_k=1, p
         sparsity_keep: Ratio of highest L2 norm perturbations to be kept.
         proj: If True, uses adversarial discrete input via proj_adv_FGSM_k, 
             else uses adversarial embeddings via adv_FGSM_k.
+        proj_nn: similarity metric to be used to project the embedding to nearest neighbors.
         create_table: If True, creates output tables and saves them in FLAGS.output_dir.
         early_return: If True, returns immediately when the standard prediction is wrong.
         return_data: If True, returns statistics from get_adv_example 
@@ -982,7 +997,8 @@ def adv_demo_by_index(model, eval_examples, sequence_offset, epsilon, adv_k=1, p
                 retval = None
 
     if proj:
-        adv_test_x_ids = proj_adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, sparsity_keep=sparsity_keep, verbose=True, xp=xp)
+        adv_test_x_ids = proj_adv_FGSM_k(model, data, k=adv_k, epsilon=epsilon, train=False, 
+            sparsity_keep=sparsity_keep, verbose=True, proj_nn=proj_nn, xp=xp)
 
         # Check if an adversarial example is found
         if adv_test_x_ids is None:
@@ -2094,7 +2110,10 @@ def main():
         # PCA_stats(model, do_embeds=True, do_outputs=False, subsample=False, mode='adv')
         # PCA_stats(model, do_embeds=False, do_outputs=True, subsample=False, mode='adv')
 
-        confidence_stats(model, subsample=True, subsample_offset=32, xp=xp)
+        # confidence_stats(model, subsample=True, subsample_offset=32, xp=xp)
+
+        print(adv_demo_by_index(model, eval_examples, 266, 5.0, adv_k=1, prefix='', sparsity_keep=None, 
+            proj=True, create_table=False, early_return=True, return_data=False, proj_nn='l2', xp=xp))
 
 if __name__ == "__main__":
     main()

@@ -1,6 +1,6 @@
 # Adversarial embeddings for BERT
 
-Built on top of the [Chainer reimplementation](https://github.com/soskek/bert-chainer) of the Google Research's [original TensorFlow implementation](https://github.com/google-research/bert). IMDB loader and processor functions taken from [this branch](https://github.com/hsm207/bert/tree/imdb).
+Adversarial embedding generation and analysis on top of BERT for sentiment classification on [IMDB Large Move Review Dataset](https://ai.stanford.edu/~amaas/data/sentiment/). Built on top of the [Chainer reimplementation](https://github.com/soskek/bert-chainer) of the Google Research's [original TensorFlow implementation](https://github.com/google-research/bert). IMDB loader and processor functions taken from [this branch](https://github.com/hsm207/bert/tree/imdb).
 
 ## Requirements
 
@@ -74,6 +74,7 @@ python run_classifier.py \
 
 ## Notes
 
+- **basic** directory contains code for adversarial embedding generation, evaluation and visualization on a network model of much smaller scale (i.e. a multi step LSTM and a linear layer as an encoder instead of BERT). **It also implements adversarial training** with an unrolled training loop. See also its own readme file.
 - Features the classifier utilize (i.e. output of the penultimate layer, pooled encodings) for all evaluation runs (standard and all four adversarial cases) can be found online. It is what the save_outputs function creates and writes.
 ```bash
 wget 'https://n.ethz.ch/~dcetin/download/train_test_outputs.pickle'
