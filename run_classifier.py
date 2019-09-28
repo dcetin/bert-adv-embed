@@ -562,7 +562,7 @@ def adv_FGSM_k(model, data, epsilon=0.6, k=1, train=False, sparsity_keep=None, x
 
     return word_embed_lookup
 
-def evaluate_fn(eval_iter, device, model, converter, adversarial=False, sparsity_keep=None, adv_k=1, epsilon=0.6):
+def evaluate_fn(eval_iter, device, model, converter, adversarial=False, sparsity_keep=None, adv_k=1, epsilon=0.6, random=False):
     """
     Adversarial or standard evaluation loop over a set of data.
 
@@ -575,12 +575,11 @@ def evaluate_fn(eval_iter, device, model, converter, adversarial=False, sparsity
         sparsity_keep: Ratio of highest L2 norm perturbations to be kept.
         adv_k: Number of successive perturbation steps.
         epsilon: Norm coefficient of the perturbation.
+        random: If True, makes evaluation with random perturbations.
 
     Returns:
         Mean losses and accuracies.
     """
-    random = False # random: If True, makes evaluation with random perturbations.
-
     xp = model.bert.xp
     eval_losses = []
     eval_accuracies = []
@@ -1557,7 +1556,7 @@ def PCA_stats(model, do_embeds=False, do_outputs=True, subsample=False, subsampl
         visualize.PCA_score_plot(train_embeds_scores, train_adv_embeds_scores, 
             test_embeds_scores, test_adv_embeds_scores, 'embed_lookup', folder=FLAGS.output_dir)
 
-def random_perturb(model, data, epsilon=0.6, k=1, sparsity_keep=None, xp=np):
+def random_perturb(model, data, epsilon=0.6, k=1, sparsity_keep=None, mask_noise=True, xp=np):
     """
     k-step FGSM on word embeddings.
 
@@ -1567,6 +1566,7 @@ def random_perturb(model, data, epsilon=0.6, k=1, sparsity_keep=None, xp=np):
         epsilon: Norm coefficient of the perturbation.
         k: Number of successive perturbation steps.
         sparsity_keep: Ratio of highest L2 norm perturbations to be kept.
+        mask_noise: If True, does not perturb padding tokens.
         xp: Matrix library, np for numpy and cp for cupy.
 
     Returns:
@@ -1580,6 +1580,8 @@ def random_perturb(model, data, epsilon=0.6, k=1, sparsity_keep=None, xp=np):
     for i in range(k):
         with chainer.using_config('train', False):
             adv_g = chainer.Variable(xp.random.random_sample(word_embed_lookup.shape, dtype=xp.float32))
+            if mask_noise:
+                adv_g = adv_g * input_mask[:,:,xp.newaxis]
 
             def sentence_level_norm(grads):
                 batchsize, embed_dim, maxlen = grads.shape
@@ -1725,24 +1727,32 @@ def main():
         eval_examples = processor.get_test_examples(FLAGS.data_dir)
         test_iter = chainer.iterators.SerialIterator(eval_examples, FLAGS.train_batch_size * 2, repeat=False, shuffle=False)
 
+        # -------------------------------- Standard Evaluation -------------------------------
         test_loss, test_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter)
         print('[test ] loss:{:.04f} acc:{:.04f}'.format(test_loss, test_acc))
 
+        # ------------------------------ Adversarial Evaluation ------------------------------
         # test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
         #     adv_k=1, epsilon=0.6, adversarial=True)
         # print('[test 1x0.6] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
-
         # test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
         #     adv_k=1, epsilon=0.6, adversarial=True, sparsity_keep=0.25)
         # print('[test 1x0.6[0.25]] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
-
         # test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
         #     adv_k=3, epsilon=0.2, adversarial=True)
         # print('[test 3x0.2] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
-
         # test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
         #     adv_k=3, epsilon=0.2, adversarial=True, sparsity_keep=0.25)
         # print('[test 3x0.2[0.25]] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
+
+        # ------------------------ Adversarial vs Random Evaluation -------------------------
+        test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
+            adv_k=1, epsilon=0.6, adversarial=False, random=True)
+        print('[test rand] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
+        test_adv_loss, test_adv_acc = evaluate_fn(test_iter, FLAGS.gpu, model, converter, 
+            adv_k=1, epsilon=0.6, adversarial=True, random=False)
+        print('[test  adv] loss:{:.04f} acc:{:.04f}'.format(test_adv_loss, test_adv_acc))
+
 
     if FLAGS.do_experiment:
 
