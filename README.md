@@ -2,6 +2,12 @@
 
 Adversarial embedding generation and analysis on top of BERT for sentiment classification on [IMDB Large Move Review Dataset](https://ai.stanford.edu/~amaas/data/sentiment/). Built on top of the [Chainer reimplementation](https://github.com/soskek/bert-chainer) of the Google Research's [original TensorFlow implementation](https://github.com/google-research/bert). IMDB loader and processor functions taken from [this branch](https://github.com/hsm207/bert/tree/imdb).
 
+![embed_examples](docs/img/embed_examples.png)
+
+Repository also includes an algorithm for projecting the adversarial embeddings to obtain adversarial discrete text candidates. Although the algorithm employs simple heuristics to make small and allowed changes, the meaning of the sentence may change as the adversary usually targets sentiment carrying tokens.
+
+![proj_examples](docs/img/proj_examples.png)
+
 ## Requirements
 
 - Python (3.6.4)
