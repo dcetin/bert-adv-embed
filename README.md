@@ -8,6 +8,13 @@ Repository also includes an algorithm for projecting the adversarial embeddings 
 
 ![proj_examples](docs/img/proj_examples.png)
 
+## Related Work
+
+- [Interpretable Adversarial Training for Text](https://arxiv.org/abs/1905.12864) by Barham and Feizi
+- [Interpretable Adversarial Perturbation in Input Embedding Space for Text](https://arxiv.org/abs/1805.02917) by Sato et al.
+- [Adversarial Training Methods for Semi-Supervised Text Classification](https://arxiv.org/abs/1605.07725) by Miyato et al.
+- [BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding](https://arxiv.org/abs/1810.04805) by Devlin et al.
+
 ## Requirements
 
 - Python (3.6.4)
